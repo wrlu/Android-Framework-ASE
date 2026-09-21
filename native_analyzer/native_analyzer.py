@@ -245,7 +245,77 @@ def scan_so(so_path):
     return result
 
 
-def analyze(workspace):
+def parse_service_list(workspace):
+    """Parse registered binder services from service_list.txt.
+
+    service_list.txt format:
+      {index}\t{name}: [{descriptor}]
+    e.g., 2  SurfaceFlingerAIDL: [android.gui.ISurfaceComposer]
+
+    Returns:
+        (descriptors, name_to_desc): a set of registered descriptors and a
+        mapping from service name to descriptor.
+    """
+    service_file = Path(workspace) / 'service_list.txt'
+    if not service_file.exists():
+        logger.warning('service_list.txt not found')
+        return set(), {}
+
+    descriptors = set()
+    name_to_desc = {}
+    with open(service_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line or ':' not in line or line.startswith('Found'):
+                continue
+            name_part, _, desc_part = line.partition(':')
+            name = re.sub(r'^\d+\s+', '', name_part.strip())
+            desc_part = desc_part.strip()
+            if desc_part.startswith('[') and desc_part.endswith(']'):
+                desc = desc_part[1:-1].strip()
+                if desc:
+                    descriptors.add(desc)
+                    name_to_desc[name] = desc
+                elif name:
+                    name_to_desc.setdefault(name, '')
+    return descriptors, name_to_desc
+
+
+def load_accessible_services(workspace, name_to_desc):
+    """Parse ASE on-device accessibility results from accessible_services.txt.
+
+    The file is the raw output of:
+      adb shell content query --uri content://net.wrlu.ase.probe
+
+    Each row looks like:
+      Row: 2 service=activity, accessible=1
+
+    The service name is mapped to its descriptor via service_list.txt.
+
+    Returns:
+        dict mapping descriptor -> accessible (bool), or None when
+        accessible_services.txt is absent.
+    """
+    accessible_file = Path(workspace) / 'accessible_services.txt'
+    if not accessible_file.exists():
+        return None
+
+    by_desc = {}
+    with open(accessible_file) as f:
+        for line in f:
+            if 'service=' not in line:
+                continue
+            fields = dict(re.findall(r'(\w+)=([^,]*)', line))
+            name = fields.get('service', '').strip()
+            accessible_val = fields.get('accessible', '').strip()
+            desc = name_to_desc.get(name, '')
+            if desc and accessible_val in ('0', '1'):
+                by_desc[desc] = (accessible_val == '1')
+    logger.info('Accessible services: %d', len(by_desc))
+    return by_desc
+
+
+def analyze(workspace, ignore_registered):
     workspace = Path(workspace).resolve()
 
     elf_files = find_elf_files(workspace)
@@ -270,19 +340,51 @@ def analyze(workspace):
             if info['client']:
                 aidl_map[desc]['clients'].add(rel_path)
 
-    # Output — only server entries
-    output_file = workspace / 'native_aidl.txt'
+    # Registered filter: load service_list.txt unless ignored.
+    # Accessibility results (accessible_services.txt) drive a separate output.
+    registered = set()
+    accessible = None
+    if not ignore_registered:
+        registered, name_to_desc = parse_service_list(workspace)
+        logger.info('Registered services: %d', len(registered))
+        accessible = load_accessible_services(workspace, name_to_desc)
 
+    # Only server entries
     server_ifaces = {desc: info for desc, info in aidl_map.items() if info['servers']}
 
-    with open(output_file, 'w') as f:
-        for desc in sorted(server_ifaces.keys()):
-            info = server_ifaces[desc]
-            so_list = ', '.join(sorted(info['servers']))
-            f.write('{} [{}]\n'.format(desc, so_list))
+    # Apply registered filter (default: only registered)
+    if not ignore_registered:
+        server_ifaces = {desc: info for desc, info in server_ifaces.items() if desc in registered}
 
+    output_file = workspace / 'native_aidl.txt'
+    write_native_aidl(output_file, server_ifaces, accessible)
     logger.info('Output: %s', output_file)
     logger.info('Total: %d server implementations', len(server_ifaces))
+
+    # Accessible subset -> separate output (clean format); original file keeps markers.
+    if accessible is not None:
+        accessible_ifaces = {d: info for d, info in server_ifaces.items()
+                             if accessible.get(d) is True}
+        accessible_file = workspace / 'accessible_native_aidl.txt'
+        write_native_aidl(accessible_file, accessible_ifaces)
+        not_accessible = sum(1 for d in server_ifaces if accessible.get(d) is False)
+        unknown = sum(1 for d in server_ifaces if d not in accessible)
+        logger.info('Accessible output: %s', accessible_file)
+        logger.info('Accessibility verification: accessible=%d not_accessible=%d unknown=%d',
+                    len(accessible_ifaces), not_accessible, unknown)
+
+
+def write_native_aidl(output_file, server_ifaces, accessible=None):
+    with open(output_file, 'w') as f:
+        for desc in sorted(server_ifaces.keys()):
+            so_list = ', '.join(sorted(server_ifaces[desc]['servers']))
+            line = '{} [{}]'.format(desc, so_list)
+            if accessible is not None:
+                if desc in accessible:
+                    line += ' [accessible={}]'.format(1 if accessible[desc] else 0)
+                else:
+                    line += ' [accessible=unknown]'
+            f.write(line + '\n')
 
 
 def main():
@@ -290,13 +392,15 @@ def main():
         description='Native AIDL Interface Analyzer - scan ELF files for AIDL interfaces'
     )
     parser.add_argument('workspace', help='Firmware dump directory (contains system/, vendor/, etc.)')
+    parser.add_argument('--ignore-registered', action='store_true',
+                        help='Ignore service_list.txt check, output all server interfaces (default: only registered)')
     args = parser.parse_args()
 
     if not os.path.isdir(args.workspace):
         logger.error('Invalid workspace directory: %s', args.workspace)
         sys.exit(1)
 
-    analyze(args.workspace)
+    analyze(args.workspace, args.ignore_registered)
 
 
 if __name__ == '__main__':

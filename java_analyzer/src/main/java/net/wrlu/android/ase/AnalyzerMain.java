@@ -11,10 +11,11 @@ public class AnalyzerMain {
 
     public static void main(String[] args) {
         if (args.length < 1) {
-            System.err.println("Usage: java -jar analyzer-all.jar <workspace_dir> [--components] [--aidl]");
-            System.err.println("  <workspace_dir>  firmware dump directory (contains packages/ etc.)");
-            System.err.println("  --components     run component accessibility analysis only");
-            System.err.println("  --aidl           run AIDL interface search only");
+            System.err.println("Usage: java -jar analyzer-all.jar <workspace_dir> [--components] [--aidl] [--ignore-registered]");
+            System.err.println("  <workspace_dir>       firmware dump directory (contains packages/ etc.)");
+            System.err.println("  --components          run component accessibility analysis only");
+            System.err.println("  --aidl                run AIDL interface search only");
+            System.err.println("  --ignore-registered   output all AIDL interfaces (default: only registered services)");
             System.err.println("  (default: run both)");
             System.exit(1);
         }
@@ -22,11 +23,14 @@ public class AnalyzerMain {
         String workspacePath = args[0];
         boolean runComponents = true;
         boolean runAidl = true;
+        boolean ignoreRegistered = false;
         for (int i = 1; i < args.length; i++) {
             if ("--components".equals(args[i])) {
                 runAidl = false;
             } else if ("--aidl".equals(args[i])) {
                 runComponents = false;
+            } else if ("--ignore-registered".equals(args[i])) {
+                ignoreRegistered = true;
             }
         }
 
@@ -46,7 +50,7 @@ public class AnalyzerMain {
             }
             if (runAidl) {
                 logger.info("=== AIDL Interface Search ===");
-                new AidlSearcher().search(ws);
+                new AidlSearcher().search(ws, ignoreRegistered);
             }
         } catch (Exception e) {
             logger.error("Analysis failed", e);

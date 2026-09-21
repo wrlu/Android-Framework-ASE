@@ -14,6 +14,9 @@ CommandResult = namedtuple('CommandResult', ['returncode', 'stdout', 'stderr'])
 
 settings_table = ['global', 'system', 'secure']
 
+ASE_PACKAGE = 'net.wrlu.ase'
+ASE_PROVIDER_URI = 'content://net.wrlu.ase.probe'
+
 
 def run_command(cmds, cwd='.'):
     try:
@@ -57,6 +60,15 @@ class AdbDevice:
 
     def root(self):
         return self._run('root')
+
+    def install(self, apk, replace=True, grant=True):
+        args = ['install']
+        if replace:
+            args.append('-r')
+        if grant:
+            args.append('-g')
+        args.append(apk)
+        return self._run(*args)
 
     def whoami(self):
         return self.shell('whoami').decode('ascii').strip()
@@ -275,6 +287,8 @@ def gen_jadx_project_file(packages_dir):
 def dump_packages(device, workspace, pkg_filter_mode):
     scope = 'all' if pkg_filter_mode == 0 else ('system' if pkg_filter_mode == 1 else 'third')
     packages = parse_pm_list(list_packages(device, scope), with_uid=True)
+    # Skip AttackSurfaceExplorer itself (installed by the collector for probing)
+    packages = [p for p in packages if p['package_name'] != ASE_PACKAGE]
     packages_dir = os.path.join(workspace, 'packages')
     os.makedirs(packages_dir, exist_ok=True)
     with open(os.path.join(workspace, 'package_index.csv'), 'w') as f:
@@ -326,9 +340,36 @@ def dump_overlays(device, workspace):
                 show_progress(i + 1, total, 'Dump overlay ' + name)
 
 
-def run_metadata_commands(device, workspace):
+def dump_accessible_services(device, workspace, ase_apk):
+    """Install AttackSurfaceExplorer and probe binder service accessibility.
+
+    Always (re)installs the ASE APK, then queries its ContentProvider and writes
+    accessible_services.txt. When the APK is missing or the provider is unavailable
+    the file is skipped (analyzers then run without accessibility verification).
+    """
+    if not os.path.isfile(ase_apk):
+        logger.warning('ASE APK not found: %s (skip accessible_services.txt)', ase_apk)
+        return
+    logger.info('Install AttackSurfaceExplorer APK: %s', ase_apk)
+    r = device.install(ase_apk)
+    if r.returncode != 0:
+        logger.warning('Failed to install ASE APK (skip accessible_services.txt): %s',
+                       r.stderr.decode('ascii', 'ignore').strip())
+        return
+
+    output = device.shell('content', 'query', '--uri', ASE_PROVIDER_URI)
+    if not output or b'Row:' not in output:
+        logger.warning('No accessible result from AttackSurfaceExplorer '
+                       '(skip accessible_services.txt)')
+        return
+    with open(os.path.join(workspace, 'accessible_services.txt'), 'wb') as f:
+        f.write(output)
+
+
+def run_metadata_commands(device, workspace, ase_apk):
     with open(os.path.join(workspace, 'service_list.txt'), 'wb') as f:
         f.write(device.shell_with_root('service', 'list'))
+    dump_accessible_services(device, workspace, ase_apk)
     with open(os.path.join(workspace, 'lshal.txt'), 'wb') as f:
         f.write(device.shell_with_root('lshal'))
     with open(os.path.join(workspace, 'netstat.txt'), 'wb') as f:
@@ -362,7 +403,6 @@ def dump_binaries(device, workspace):
         for p in ['system', 'vendor', 'system_ext', 'product', 'odm']:
             device.shell('mkdir', '/sdcard/.dump_android_script/' + p)
 
-    logger.info('[Task 4] Dump binaries')
     for part in ['system', 'vendor', 'system_ext', 'product', 'odm']:
         for sub in ['bin', 'lib64', 'lib', 'etc']:
             dump_binary_folder(device, '/' + part + '/' + sub + '/', part, workspace, part)
@@ -387,10 +427,18 @@ def main():
     parser = argparse.ArgumentParser(description='Dump useful files from Android devices.')
     parser.add_argument('-o', '--output', help='Output directory for dumped firmware (default: current directory).')
     parser.add_argument('-d', '--device', help='adb serial id (non-interactive selection).')
+    parser.add_argument('--ase-apk', help='AttackSurfaceExplorer APK installed before probing '
+                                         '(default: ../AttackSurfaceExplorer/app/build/outputs/apk/debug/app-debug.apk).')
+    parser.add_argument('--probe-only', action='store_true',
+                        help='Only run the binder service accessibility probe and generate accessible_services.txt.')
     exclusive_group = parser.add_mutually_exclusive_group()
     exclusive_group.add_argument('-s', '--system', action='store_true', help='Only dump system packages.')
     exclusive_group.add_argument('-3', '--third-party', action='store_true', help='Only dump third party packages.')
     args = parser.parse_args()
+
+    ase_apk = args.ase_apk or os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        '..', 'AttackSurfaceExplorer', 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk'))
 
     pkg_filter_mode = 0
     if args.system:
@@ -405,6 +453,12 @@ def main():
 
     device = select_device(args.device)
     if device is None:
+        return
+
+    if args.probe_only:
+        logger.info('[Probe] Run binder service probe only')
+        dump_accessible_services(device, workspace, ase_apk)
+        logger.info('Done')
         return
 
     try:
@@ -424,7 +478,7 @@ def main():
         dump_selinux_policy(device, workspace)
         dump_init_scripts(device, workspace)
         logger.info('[Task 4] Run useful commands')
-        run_metadata_commands(device, workspace)
+        run_metadata_commands(device, workspace, ase_apk)
     finally:
         cleanup_tmp(device)
 
