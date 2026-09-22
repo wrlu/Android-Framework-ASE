@@ -249,10 +249,7 @@ Provider 通过 `Binder.getCallingUid()` 限制调用方：仅本应用、system
 
 #### 2. 脚本编写规范
 
-脚本支持两种编写模式：
-
-##### 方式 A：实现标准契约接口（推荐）
-实现 `AseScript` 接口，可直接获得 Service 的 `Context` 上下文及主机端传递的入参字符串：
+所有动态验证脚本均实现标准契约接口 `AseScript`，可直接获得 Service 的 `Context` 上下文及主机端传递的入参字符串：
 
 ```java
 package net.wrlu.ase.payload;
@@ -275,12 +272,6 @@ public class TestServiceProbe implements AseScript {
     }
 }
 ```
-
-##### 方式 B：轻量无依赖模式（纯反射）
-无需依赖 ASE 任何类库，仅依赖标准 Android SDK 即可编写。只需提供以下任一入口方法：
-- `public static String run(Context context, String args)` / `public String run(Context context, String args)`
-- `public static String run(String args)` / `public String run(String args)`
-- `public static void main(String[] args)`
 
 #### 3. 主机端执行工具（runner.py）
 

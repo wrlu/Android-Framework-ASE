@@ -27,8 +27,6 @@ import java.io.PrintStream;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.lang.reflect.Constructor;
-import java.lang.reflect.Method;
-import java.lang.reflect.Modifier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -216,67 +214,15 @@ public class ScriptExecutionService extends Service {
         }
     }
 
-    private Object invokeEntry(Class<?> clazz, String args) throws Throwable {
-        // 1. AseScript interface
-        if (AseScript.class.isAssignableFrom(clazz)) {
-            Constructor<?> ctor = clazz.getDeclaredConstructor();
-            ctor.setAccessible(true);
-            AseScript script = (AseScript) ctor.newInstance();
-            return script.run(this, args);
+    private String invokeEntry(Class<?> clazz, String args) throws Throwable {
+        if (!AseScript.class.isAssignableFrom(clazz)) {
+            throw new IllegalArgumentException("Entry class " + clazz.getName()
+                    + " must implement " + AseScript.class.getName());
         }
-
-        // 2. run(Context, String)
-        Method m = findMethod(clazz, "run", Context.class, String.class);
-        if (m != null) {
-            m.setAccessible(true);
-            Object target = Modifier.isStatic(m.getModifiers()) ? null : createInstance(clazz);
-            return m.invoke(target, this, args);
-        }
-
-        // 3. run(String)
-        m = findMethod(clazz, "run", String.class);
-        if (m != null) {
-            m.setAccessible(true);
-            Object target = Modifier.isStatic(m.getModifiers()) ? null : createInstance(clazz);
-            return m.invoke(target, args);
-        }
-
-        // 4. run()
-        m = findMethod(clazz, "run");
-        if (m != null) {
-            m.setAccessible(true);
-            Object target = Modifier.isStatic(m.getModifiers()) ? null : createInstance(clazz);
-            return m.invoke(target);
-        }
-
-        // 5. main(String[])
-        m = findMethod(clazz, "main", String[].class);
-        if (m != null && Modifier.isStatic(m.getModifiers())) {
-            m.setAccessible(true);
-            String[] splitArgs = args.isEmpty() ? new String[0] : args.split("\\s+");
-            return m.invoke(null, (Object) splitArgs);
-        }
-
-        throw new NoSuchMethodException("No supported entry method found in " + clazz.getName()
-                + " (implement AseScript, or define run(Context, String) / run(String) / run() / main(String[]))");
-    }
-
-    private static Object createInstance(Class<?> clazz) throws Exception {
         Constructor<?> ctor = clazz.getDeclaredConstructor();
         ctor.setAccessible(true);
-        return ctor.newInstance();
-    }
-
-    private static Method findMethod(Class<?> clazz, String name, Class<?>... paramTypes) {
-        try {
-            return clazz.getDeclaredMethod(name, paramTypes);
-        } catch (NoSuchMethodException e) {
-            try {
-                return clazz.getMethod(name, paramTypes);
-            } catch (NoSuchMethodException ex) {
-                return null;
-            }
-        }
+        AseScript script = (AseScript) ctor.newInstance();
+        return script.run(this, args);
     }
 
     private File resolveDexFile(String path) {
