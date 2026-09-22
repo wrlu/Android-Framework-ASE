@@ -15,7 +15,7 @@ CommandResult = namedtuple('CommandResult', ['returncode', 'stdout', 'stderr'])
 settings_table = ['global', 'system', 'secure']
 
 ASE_PACKAGE = 'net.wrlu.ase'
-ASE_PROVIDER_URI = 'content://net.wrlu.ase.probe'
+ASE_PROVIDER_URI = 'content://net.wrlu.ase.probe/binder_service'
 ASE_PROJECT_DIR = os.path.normpath(os.path.join(
     os.path.dirname(os.path.abspath(__file__)), '..', 'AttackSurfaceExplorer'))
 DEFAULT_ASE_APK = os.path.join(

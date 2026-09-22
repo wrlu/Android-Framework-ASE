@@ -22,7 +22,7 @@
         </activity>
 
         <provider
-            android:name=".probe.BinderProbeProvider"
+            android:name=".data.DataProvider"
             android:authorities="net.wrlu.ase.probe"
             android:exported="true" />
     </application>

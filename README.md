@@ -197,14 +197,14 @@ cd AttackSurfaceExplorer
 adb install -r -g app/build/outputs/apk/release/app-release.apk
 ```
 
-通过导出的 ContentProvider 探测（URI 固定为 `content://net.wrlu.ase.probe`）：
+通过导出的通用 DataProvider 探测（当前端点 URI 为 `content://net.wrlu.ase.probe/binder_service`）：
 
 ```bash
 # 全部服务
-adb shell content query --uri content://net.wrlu.ase.probe
+adb shell content query --uri content://net.wrlu.ase.probe/binder_service
 
 # 单个服务（--where 传服务名）
-adb shell content query --uri content://net.wrlu.ase.probe --where "activity"
+adb shell content query --uri content://net.wrlu.ase.probe/binder_service --where "activity"
 ```
 
 输出示例：

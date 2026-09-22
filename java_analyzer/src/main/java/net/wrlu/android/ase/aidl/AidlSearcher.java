@@ -165,7 +165,7 @@ public class AidlSearcher {
 
     /**
      * Parse ASE on-device accessibility results from accessible_services.txt (raw output of
-     * {@code adb shell content query --uri content://net.wrlu.ase.probe}).
+     * {@code adb shell content query --uri content://net.wrlu.ase.probe/binder_service}).
      *
      * <p>Rows look like {@code Row: 2 service=activity, accessible=1}; the service name is
      * mapped to its descriptor via service_list.txt.

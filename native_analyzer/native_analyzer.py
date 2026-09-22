@@ -285,7 +285,7 @@ def load_accessible_services(workspace, name_to_desc):
     """Parse ASE on-device accessibility results from accessible_services.txt.
 
     The file is the raw output of:
-      adb shell content query --uri content://net.wrlu.ase.probe
+      adb shell content query --uri content://net.wrlu.ase.probe/binder_service
 
     Each row looks like:
       Row: 2 service=activity, accessible=1
