@@ -20,5 +20,5 @@ if [ $# -lt 1 ]; then
     exit 1
 fi
 
-JAVA_OPTS="${JAVA_OPTS:--Xmx4g}"
+JAVA_OPTS="${JAVA_OPTS:--XX:MaxRAMPercentage=50.0}"
 exec java $JAVA_OPTS -jar "$JAR_PATH" "$@"

@@ -91,7 +91,7 @@ cd java_analyzer
 | `--ignore-registered` | 不按 `service_list.txt` 过滤，输出全部 AIDL 接口 |
 | （默认） | 两个分析都运行 |
 
-JVM 默认 `-Xmx4g`，可用 `JAVA_OPTS` 覆盖：`JAVA_OPTS="-Xmx8g" ./analyzer.sh ...`
+JVM 默认 `-XX:MaxRAMPercentage=50.0`（分配当前设备内存的 50%），可用 `JAVA_OPTS` 覆盖：`JAVA_OPTS="-Xmx8g" ./analyzer.sh ...`
 
 ### 组件权限分析
 
