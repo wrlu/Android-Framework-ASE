@@ -41,15 +41,17 @@ public class ComponentAnalyzer {
             if (baseData == null) {
                 logger.warn("Cached file invalid, re-scan: {}", allCompFile);
                 baseData = scanDir(packagesDir);
-                try (FileWriter fw = new FileWriter(allCompFile)) {
-                    GSON.toJson(baseData, fw);
-                }
             }
         } else {
             baseData = scanDir(packagesDir);
-            try (FileWriter fw = new FileWriter(allCompFile)) {
-                GSON.toJson(baseData, fw);
-            }
+        }
+
+        // Store APK paths relative to the workspace root
+        for (PackageInfo info : baseData) {
+            info.filename = toRelativePath(ws.getRoot(), info.filename);
+        }
+        try (FileWriter fw = new FileWriter(allCompFile)) {
+            GSON.toJson(baseData, fw);
         }
 
         Map<String, Object> result = analyze(baseData);
@@ -59,6 +61,26 @@ public class ComponentAnalyzer {
             GSON.toJson(result, fw);
         }
         logger.info("Component analysis done: {}", accessibleFile.getAbsolutePath());
+    }
+
+    /**
+     * Convert an absolute APK path to one relative to the workspace root; leave
+     * non-absolute paths unchanged.
+     */
+    private static String toRelativePath(File root, String path) {
+        if (path == null || path.isEmpty()) {
+            return path;
+        }
+        File file = new File(path);
+        if (!file.isAbsolute()) {
+            return path;
+        }
+        try {
+            return root.toPath().toAbsolutePath().normalize()
+                    .relativize(file.toPath().toAbsolutePath().normalize()).toString();
+        } catch (IllegalArgumentException e) {
+            return path;
+        }
     }
 
     private List<PackageInfo> scanDir(File packagesDir) {
@@ -121,8 +143,7 @@ public class ComponentAnalyzer {
             if (info.protectedBroadcasts != null) allProtected.addAll(info.protectedBroadcasts);
         }
 
-        Map<String, List<Map<String, Object>>> undef = initBuckets();
-        Map<String, List<Map<String, Object>>> unpriv = initBuckets();
+        Map<String, List<Map<String, Object>>> issues = initBuckets();
 
         for (Component component : allComponents) {
             Map<String, String> status = new LinkedHashMap<>();
@@ -154,18 +175,18 @@ public class ComponentAnalyzer {
                 boolean appended = false;
                 if ("unprivileged".equals(status.get("permission"))) {
                     if ("undefined".equals(status.get("writePermission")) || "undefined".equals(status.get("readPermission"))) {
-                        undef.get("provider").add(providerIssueMap(component));
+                        issues.get("provider").add(providerIssueMap(component, "undefined"));
                         appended = true;
                     } else if ("unprivileged".equals(status.get("writePermission")) || "unprivileged".equals(status.get("readPermission"))) {
-                        unpriv.get("provider").add(providerIssueMap(component));
+                        issues.get("provider").add(providerIssueMap(component, "unprivileged"));
                         appended = true;
                     }
                 } else if ("undefined".equals(status.get("permission"))) {
                     if ("unprivileged".equals(status.get("writePermission")) || "unprivileged".equals(status.get("readPermission"))) {
-                        undef.get("provider").add(providerIssueMap(component));
+                        issues.get("provider").add(providerIssueMap(component, "undefined"));
                         appended = true;
                     } else if ("undefined".equals(status.get("writePermission")) || "undefined".equals(status.get("readPermission"))) {
-                        undef.get("provider").add(providerIssueMap(component));
+                        issues.get("provider").add(providerIssueMap(component, "undefined"));
                         appended = true;
                     }
                 }
@@ -186,14 +207,14 @@ public class ComponentAnalyzer {
                                         if (isPermissionPrivileged(dp)) {
                                             privileged = true;
                                         } else {
-                                            unpriv.get("provider").add(providerIssueMap(component));
+                                            issues.get("provider").add(providerIssueMap(component, "unprivileged"));
                                             privileged = false;
                                         }
                                         break;
                                     }
                                 }
                                 if (!defined) {
-                                    undef.get("provider").add(providerIssueMap(component));
+                                    issues.get("provider").add(providerIssueMap(component, "undefined"));
                                 }
                                 if (!defined || !privileged) {
                                     found = true;
@@ -236,17 +257,14 @@ public class ComponentAnalyzer {
                 }
 
                 if ("undefined".equals(status.get("permission"))) {
-                    undef.get(component.type).add(simpleIssueMap(component));
+                    issues.get(component.type).add(simpleIssueMap(component, "undefined"));
                 } else if ("unprivileged".equals(status.get("permission"))) {
-                    unpriv.get(component.type).add(simpleIssueMap(component));
+                    issues.get(component.type).add(simpleIssueMap(component, "unprivileged"));
                 }
             }
         }
 
-        Map<String, Object> result = new LinkedHashMap<>();
-        result.put("undefined_permissions", undef);
-        result.put("unprivileged_permissions", unpriv);
-        return result;
+        return new LinkedHashMap<>(issues);
     }
 
     private static boolean isPermissionPrivileged(DefinedPermission dp) {
@@ -314,8 +332,9 @@ public class ComponentAnalyzer {
         return buckets;
     }
 
-    private static Map<String, Object> providerIssueMap(Component c) {
+    private static Map<String, Object> providerIssueMap(Component c, String issueType) {
         Map<String, Object> m = new LinkedHashMap<>();
+        m.put("type", issueType);
         m.put("name", c.name);
         m.put("writePermission", c.writePermission);
         m.put("readPermission", c.readPermission);
@@ -324,8 +343,9 @@ public class ComponentAnalyzer {
         return m;
     }
 
-    private static Map<String, Object> simpleIssueMap(Component c) {
+    private static Map<String, Object> simpleIssueMap(Component c, String issueType) {
         Map<String, Object> m = new LinkedHashMap<>();
+        m.put("type", issueType);
         m.put("name", c.name);
         m.put("permission", c.permission);
         if (c.intentFilters != null) {
