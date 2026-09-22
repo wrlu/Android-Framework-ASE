@@ -16,6 +16,10 @@ settings_table = ['global', 'system', 'secure']
 
 ASE_PACKAGE = 'net.wrlu.ase'
 ASE_PROVIDER_URI = 'content://net.wrlu.ase.probe'
+ASE_PROJECT_DIR = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '..', 'AttackSurfaceExplorer'))
+DEFAULT_ASE_APK = os.path.join(
+    ASE_PROJECT_DIR, 'app', 'build', 'outputs', 'apk', 'release', 'app-release.apk')
 
 
 def run_command(cmds, cwd='.'):
@@ -340,13 +344,30 @@ def dump_overlays(device, workspace):
                 show_progress(i + 1, total, 'Dump overlay ' + name)
 
 
-def dump_accessible_services(device, workspace, ase_apk):
-    """Install AttackSurfaceExplorer and probe binder service accessibility.
+def build_ase_apk():
+    """Build the AttackSurfaceExplorer release APK via its Gradle wrapper."""
+    gradlew = os.path.join(ASE_PROJECT_DIR, 'gradlew')
+    if not os.path.isfile(gradlew):
+        logger.warning('AttackSurfaceExplorer project not found: %s', ASE_PROJECT_DIR)
+        return False
+    logger.info('Build AttackSurfaceExplorer release APK')
+    r = run_command([gradlew, ':app:assembleRelease'], cwd=ASE_PROJECT_DIR)
+    if r.returncode != 0:
+        logger.warning('Failed to build ASE APK: %s',
+                       r.stderr.decode('ascii', 'ignore').strip())
+        return False
+    return True
 
-    Always (re)installs the ASE APK, then queries its ContentProvider and writes
-    accessible_services.txt. When the APK is missing or the provider is unavailable
-    the file is skipped (analyzers then run without accessibility verification).
+
+def dump_accessible_services(device, workspace, ase_apk):
+    """Build, install AttackSurfaceExplorer and probe binder service accessibility.
+
+    Builds the release APK, (re)installs it, then queries its ContentProvider and
+    writes accessible_services.txt. When the APK is missing or the provider is
+    unavailable the file is skipped (analyzers then run without accessibility
+    verification).
     """
+    build_ase_apk()
     if not os.path.isfile(ase_apk):
         logger.warning('ASE APK not found: %s (skip accessible_services.txt)', ase_apk)
         return
@@ -428,7 +449,7 @@ def main():
     parser.add_argument('-o', '--output', help='Output directory for dumped firmware (default: current directory).')
     parser.add_argument('-d', '--device', help='adb serial id (non-interactive selection).')
     parser.add_argument('--ase-apk', help='AttackSurfaceExplorer APK installed before probing '
-                                         '(default: ../AttackSurfaceExplorer/app/build/outputs/apk/debug/app-debug.apk).')
+                                         '(default: ../AttackSurfaceExplorer/app/build/outputs/apk/release/app-release.apk).')
     parser.add_argument('--probe-only', action='store_true',
                         help='Only run the binder service accessibility probe and generate accessible_services.txt.')
     exclusive_group = parser.add_mutually_exclusive_group()
@@ -436,9 +457,7 @@ def main():
     exclusive_group.add_argument('-3', '--third-party', action='store_true', help='Only dump third party packages.')
     args = parser.parse_args()
 
-    ase_apk = args.ase_apk or os.path.normpath(os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        '..', 'AttackSurfaceExplorer', 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk'))
+    ase_apk = args.ase_apk or DEFAULT_ASE_APK
 
     pkg_filter_mode = 0
     if args.system:

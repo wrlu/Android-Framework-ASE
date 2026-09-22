@@ -49,7 +49,7 @@ python3 collect.py -o <output_dir> [-d <device_serial>] [-s | -3]
 |------|------|
 | `-o, --output` | 输出目录（默认当前目录） |
 | `-d, --device` | adb 设备 serial（非交互选择） |
-| `--ase-apk` | 探测用 AttackSurfaceExplorer APK 路径（默认 `../AttackSurfaceExplorer/app/build/outputs/apk/debug/app-debug.apk`） |
+| `--ase-apk` | 探测用 AttackSurfaceExplorer APK 路径（默认 `../AttackSurfaceExplorer/app/build/outputs/apk/release/app-release.apk`） |
 | `--probe-only` | 仅安装 APK 并生成 `accessible_services.txt`，不 dump 固件 |
 | `-s, --system` | 仅 dump 系统包 |
 | `-3, --third-party` | 仅 dump 第三方应用（跳过 apex/binaries/selinux） |
@@ -189,10 +189,12 @@ android.system.keystore2.IKeystoreService [system/lib64/android.system.keystore2
 
 静态分析只能判断接口存在，无法判断实机上能否真正拿到 binder 句柄。AttackSurfaceExplorer 以 **APK 自身 uid/权限** 通过 `android.os.ServiceManager` 获取服务，仅探测能否取到 `IBinder`——不读取 descriptor，也不调用 AIDL 方法。
 
+APK 使用内置的 `ase-release.jks` 做 release 签名（匿名化信息）。collector 会自动编译并安装，也可手动操作：
+
 ```bash
 cd AttackSurfaceExplorer
-./gradlew :app:assembleDebug
-adb install -r -g app/build/outputs/apk/debug/app-debug.apk
+./gradlew :app:assembleRelease
+adb install -r -g app/build/outputs/apk/release/app-release.apk
 ```
 
 通过导出的 ContentProvider 探测（URI 固定为 `content://net.wrlu.ase.probe`）：
@@ -228,8 +230,8 @@ Provider 通过 `Binder.getCallingUid()` 限制调用方：仅本应用、system
 ## 完整流程
 
 ```bash
-# 0. 构建探测 APK
-cd AttackSurfaceExplorer && ./gradlew :app:assembleDebug
+# 0. 构建探测 APK（collector 也会自动编译安装）
+cd AttackSurfaceExplorer && ./gradlew :app:assembleRelease
 
 # 1. 采集固件（同时生成 accessible_services.txt）
 cd ../collector && python3 collect.py -o ~/firmware/pixel8
