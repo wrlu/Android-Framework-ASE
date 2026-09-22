@@ -227,6 +227,41 @@ Row: 2 service=SurfaceFlingerAIDL, accessible=1
 
 Provider 通过 `Binder.getCallingUid()` 限制调用方：仅本应用、system(1000)、adb shell(2000) 与 root(0) 可用。
 
+### 动态脚本自主验证（runner.py）
+
+针对深度攻击面探测与 AI 自主代码验证需求，AttackSurfaceExplorer 提供了**动态 DEX 加载与前台服务执行**能力：
+
+- **完全免安装、零弹窗阻断**：AI 或测试人员编写的 Java 脚本无需重新打包/安装 APK（规避 OEM 系统的 USB 安装确认弹窗），编译为单文件 `.dex` 后直接推送到设备运行。
+- **进程级隔离**：执行端运行在独立的 `:runner` 前台服务进程（`ScriptExecutionService`）中，崩溃或异常完全不影响主进程与 ContentProvider。
+- **环境免除限制**：`:runner` 进程启动时自动调用 `HiddenApiBypass.addHiddenApiExemptions("")`，脚本可直接无限制反射/调用所有 `@hide` 框架 API 及 `ServiceManager`。
+- **标准化脚本接口**：实现 `AseScript` 接口（或提供 `run(Context, String)` / `main(String[])` 静态方法）：
+
+```java
+package net.wrlu.ase.payload;
+
+import android.content.Context;
+import android.os.IBinder;
+import net.wrlu.ase.binder.ServiceManager;
+import net.wrlu.ase.script.AseScript;
+
+public class TestServiceProbe implements AseScript {
+    @Override
+    public String run(Context context, String args) throws Throwable {
+        String name = (args != null && !args.isEmpty()) ? args : "activity";
+        IBinder binder = ServiceManager.getService(name);
+        return binder != null ? "GOT_BINDER: " + binder.getInterfaceDescriptor() : "DENIED";
+    }
+}
+```
+
+主机端执行工具（自动编译 `.java` → `.dex`，推送并拉起服务获取结构化结果）：
+
+```bash
+python3 AttackSurfaceExplorer/runner.py AttackSurfaceExplorer/sample_scripts/TestServiceProbe.java -a "activity"
+```
+
+返回结构化 JSON（包含执行状态 `success`/`error`、返回值、`stdout` 输出、异常堆栈及耗时）。
+
 ## 完整流程
 
 ```bash

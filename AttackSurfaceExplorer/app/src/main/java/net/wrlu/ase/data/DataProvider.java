@@ -11,6 +11,7 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
 import net.wrlu.ase.data.handlers.BinderServiceHandler;
+import net.wrlu.ase.data.handlers.ScriptResultHandler;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -51,6 +52,7 @@ public class DataProvider extends ContentProvider {
     private void registerHandlers() {
         handlers.clear();
         register(new BinderServiceHandler());
+        register(new ScriptResultHandler(getContext()));
         // Register additional DataHandler implementations here.
     }
 
