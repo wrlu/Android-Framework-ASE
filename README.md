@@ -23,10 +23,14 @@ Android 固件攻击面分析工具，覆盖「固件采集 → 静态分析 →
 │       └── workspace/
 ├── native_analyzer/
 │   └── native_analyzer.py         # Native AIDL 扫描
-└── AttackSurfaceExplorer/         # 设备端 Binder 探测 APK
+└── AttackSurfaceExplorer/         # 设备端 Binder 探测与动态执行 APK
+    ├── runner.py                  # 主机端动态脚本编译与执行工具
+    ├── sample_scripts/            # 验证脚本示例
     └── app/src/main/java/net/wrlu/ase/
         ├── binder/                # ServiceManager（HiddenApiBypass）
-        └── probe/                 # BinderProber + 导出 ContentProvider
+        ├── data/                  # 通用 DataProvider & Handlers
+        ├── probe/                 # BinderProber
+        └── script/                # 动态执行前台服务（:runner 独立进程）
 ```
 
 ## 环境要求
@@ -229,12 +233,26 @@ Provider 通过 `Binder.getCallingUid()` 限制调用方：仅本应用、system
 
 ### 动态脚本自主验证（runner.py）
 
-针对深度攻击面探测与 AI 自主代码验证需求，AttackSurfaceExplorer 提供了**动态 DEX 加载与前台服务执行**能力：
+针对深度攻击面探测与 AI 自主代码验证需求，AttackSurfaceExplorer 提供了**动态 DEX 加载与前台服务执行**能力。
 
-- **完全免安装、零弹窗阻断**：AI 或测试人员编写的 Java 脚本无需重新打包/安装 APK（规避 OEM 系统的 USB 安装确认弹窗），编译为单文件 `.dex` 后直接推送到设备运行。
-- **进程级隔离**：执行端运行在独立的 `:runner` 前台服务进程（`ScriptExecutionService`）中，崩溃或异常完全不影响主进程与 ContentProvider。
-- **环境免除限制**：`:runner` 进程启动时自动调用 `HiddenApiBypass.addHiddenApiExemptions("")`，脚本可直接无限制反射/调用所有 `@hide` 框架 API 及 `ServiceManager`。
-- **标准化脚本接口**：实现 `AseScript` 接口（或提供 `run(Context, String)` / `main(String[])` 静态方法）：
+#### 1. 背景与设计优势
+
+传统实机验证通常需要开发独立测试 APK 并执行 `adb install`。在各类 OEM 设备（小米 MIUI/HyperOS、OPPO ColorOS、vivo OriginOS、华为 HarmonyOS 等）及受控 Android 14/15/17 设备上，`adb install` 极易触发系统的 USB 安装授权弹窗、锁屏密码或指纹验证，导致 AI 自主迭代流程被物理阻塞。
+
+本方案将 AttackSurfaceExplorer 作为常驻测试宿主（固件采集阶段一次性安装）：
+- **完全免安装、零弹窗阻断**：AI 或测试人员生成的 Java 逻辑由主机端工具自动编译为单文件 `.dex` 并推送到设备执行，彻底规避 PackageInstaller 交互。
+- **极速秒级闭环**：`javac` + `d8` 编译与推送执行耗时通常在 1 秒以内，非常适合 AI 在报错后快速微调参数和重试。
+- **进程级崩溃隔离**：执行端运行在独立的 `:runner` 前台服务进程（`ScriptExecutionService`）中，即便动态代码发生 Crash、OOM 或死循环，完全不影响主进程与 ContentProvider 的正常工作。
+- **环境权限完全解禁**：`:runner` 进程在 `onCreate()` 时自动调用 `HiddenApiBypass.addHiddenApiExemptions("")`，动态脚本可直接、无限制反射和调用所有被 `@hide` 的系统私有 API 及 `ServiceManager`。
+- **规避 SELinux W^X 保护**：服务接收到 DEX 后自动拷贝至受系统信任的应用私有代码缓存目录（`context.getCodeCacheDir()`），再使用 `PathClassLoader` 加载执行，完美符合 Android 8.0+ / 14+ 严格的 W^X 安全策略。
+- **突破后台限制与超时**：通过 `am start-foreground-service` 配合 Android 14+ 声明的 `specialUse` 前台服务类型，不受后台广播超时或普通 ContentProvider 同步调用的 ANR 约束。
+
+#### 2. 脚本编写规范
+
+脚本支持两种编写模式：
+
+##### 方式 A：实现标准契约接口（推荐）
+实现 `AseScript` 接口，可直接获得 Service 的 `Context` 上下文及主机端传递的入参字符串：
 
 ```java
 package net.wrlu.ase.payload;
@@ -248,19 +266,79 @@ public class TestServiceProbe implements AseScript {
     @Override
     public String run(Context context, String args) throws Throwable {
         String name = (args != null && !args.isEmpty()) ? args : "activity";
+        System.out.println("[Script] Probing service: " + name);
         IBinder binder = ServiceManager.getService(name);
-        return binder != null ? "GOT_BINDER: " + binder.getInterfaceDescriptor() : "DENIED";
+        if (binder == null) {
+            return "DENIED_OR_NOT_FOUND";
+        }
+        return "SUCCESS: alive=" + binder.isBinderAlive() + ", desc=" + binder.getInterfaceDescriptor();
     }
 }
 ```
 
-主机端执行工具（自动编译 `.java` → `.dex`，推送并拉起服务获取结构化结果）：
+##### 方式 B：轻量无依赖模式（纯反射）
+无需依赖 ASE 任何类库，仅依赖标准 Android SDK 即可编写。只需提供以下任一入口方法：
+- `public static String run(Context context, String args)` / `public String run(Context context, String args)`
+- `public static String run(String args)` / `public String run(String args)`
+- `public static void main(String[] args)`
+
+#### 3. 主机端执行工具（runner.py）
+
+主机端提供一键自动化执行脚本 `AttackSurfaceExplorer/runner.py`。它会自动寻找本地 Android SDK 中的 `javac`、`d8` 和 `android.jar`，完成源码编译、DEX 打包、推送到真机、拉起前台服务、并以结构化 JSON 格式提取执行结果。
 
 ```bash
+python3 AttackSurfaceExplorer/runner.py <script.java | script.dex> [选项]
+```
+
+| 参数 | 说明 |
+|------|------|
+| `script` | 待执行的 `.java` 源码文件或预编译 `.dex` 文件路径 |
+| `-c, --entry-class` | 入口类的全限定名（传入 `.java` 时会自动从源码解析，可省略） |
+| `-a, --args` | 传递给脚本 `run()` 方法的入参字符串（如 JSON 或服务名，默认空） |
+| `-d, --device` | 指定 adb 设备 serial（多设备连接时使用） |
+| `-t, --timeout` | 脚本执行最大超时时间，单位秒（默认 `30` 秒） |
+| `-o, --output` | 将返回的结构化执行结果 JSON 保存到本地文件 |
+| `--no-clean` | 执行完成后保留推送到设备上的临时 DEX 文件（默认自动清理） |
+
+#### 4. 执行示例与输出格式
+
+执行示例：
+
+```bash
+# 传入 Java 源码自动编译并在真机执行，入参指定探测 activity 服务
 python3 AttackSurfaceExplorer/runner.py AttackSurfaceExplorer/sample_scripts/TestServiceProbe.java -a "activity"
 ```
 
-返回结构化 JSON（包含执行状态 `success`/`error`、返回值、`stdout` 输出、异常堆栈及耗时）。
+控制台输出：
+
+```text
+[Target] Entry class: net.wrlu.ase.payload.TestServiceProbe
+[Compile] javac: /opt/homebrew/opt/openjdk@21/bin/javac
+[Compile] d8: /Users/xiaolu/Library/Android/sdk/build-tools/37.0.0/d8
+[Compile] android.jar: /Users/xiaolu/Library/Android/sdk/platforms/android-37.0/android.jar
+[Compile] DEX built successfully: 2084 bytes
+[ADB] Push DEX to /data/local/tmp/ase_script.dex
+[ADB] Start ScriptExecutionService (:runner process)
+[Runner] Waiting for execution result (timeout 30s)...
+
+==================== EXECUTION RESULT ====================
+Status:     success
+Elapsed:    15 ms
+Return Val: SUCCESS: alive=true, desc=android.app.IActivityManager
+Stdout:
+[Script] Probing service: activity
+==========================================================
+```
+
+返回的结构化 JSON 字段：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `status` | `string` | 执行状态：`success` 或 `error` |
+| `result` | `string` | 脚本入口方法的返回值（转字符串） |
+| `stdout` | `string` | 脚本执行期间通过 `System.out` / `System.err` 输出的全部日志内容 |
+| `error` | `string` | 发生异常时的完整 Java Exception 堆栈追踪信息 |
+| `elapsed_ms` | `number` | 脚本实际执行耗时（毫秒） |
 
 ## 完整流程
 
