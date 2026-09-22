@@ -15,7 +15,6 @@ import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
 
 import org.json.JSONObject;
-import org.lsposed.hiddenapibypass.HiddenApiBypass;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -58,14 +57,6 @@ public class ScriptExecutionService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            try {
-                HiddenApiBypass.addHiddenApiExemptions("");
-                Log.i(TAG, "HiddenApiBypass exemptions applied in :runner process");
-            } catch (Throwable t) {
-                Log.w(TAG, "Failed to apply HiddenApiBypass exemptions: " + t.getMessage());
-            }
-        }
         createNotificationChannel();
     }
 
