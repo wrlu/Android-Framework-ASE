@@ -53,7 +53,7 @@ python3 collect.py -o <output_dir> [-d <device_serial>] [-s | -3]
 |------|------|
 | `-o, --output` | 输出目录（默认当前目录） |
 | `-d, --device` | adb 设备 serial（非交互选择） |
-| `--ase-apk` | 探测用 AttackSurfaceExplorer APK 路径（默认 `../AttackSurfaceExplorer/app/build/outputs/apk/release/app-release.apk`） |
+| `--ase-apk` | 探测用 AttackSurfaceExplorer APK 路径（默认优先使用预编译 `../AttackSurfaceExplorer/app-release.apk`） |
 | `--probe-only` | 仅安装 APK 并生成 `accessible_services.txt`，不 dump 固件 |
 | `-s, --system` | 仅 dump 系统包 |
 | `-3, --third-party` | 仅 dump 第三方应用（跳过 apex/binaries/selinux） |
@@ -193,7 +193,7 @@ android.system.keystore2.IKeystoreService [system/lib64/android.system.keystore2
 
 静态分析只能判断接口存在，无法判断实机上能否真正拿到 binder 句柄。AttackSurfaceExplorer 以 **APK 自身 uid/权限** 通过 `android.os.ServiceManager` 获取服务，仅探测能否取到 `IBinder`——不读取 descriptor，也不调用 AIDL 方法。
 
-APK 使用内置的 `ase-release.jks` 做 release 签名（匿名化信息）。collector 会自动编译并安装，也可手动操作：
+APK 使用内置的 `ase-release.jks` 做 release 签名（匿名化信息）。仓库根目录已包含预编译的 `AttackSurfaceExplorer/app-release.apk`，`collector/collect.py` 默认优先使用该预编译包并以覆盖安装（`adb install -r -g`）方式推送到设备。若需修改 ASE 源码并重新编译，也可手动操作：
 
 ```bash
 cd AttackSurfaceExplorer
@@ -309,7 +309,7 @@ python3 AttackSurfaceExplorer/runner.py payload.dex -c net.wrlu.ase.payload.Test
 ## 完整流程
 
 ```bash
-# 0. 构建探测 APK（collector 也会自动编译安装）
+# 0. 构建探测 APK（可选，已内置预编译 AttackSurfaceExplorer/app-release.apk，仅修改源码时需要）
 cd AttackSurfaceExplorer && ./gradlew :app:assembleRelease
 
 # 1. 采集固件（同时生成 accessible_services.txt）
