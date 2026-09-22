@@ -11,13 +11,14 @@ if [ ! -f "$JAR_PATH" ]; then
 fi
 
 if [ $# -lt 1 ]; then
-    echo "Usage: $0 <workspace_dir> [--components] [--aidl]"
-    echo "  <workspace_dir>  firmware dump directory (contains packages/ etc.)"
-    echo "  --components     run component accessibility analysis only"
-    echo "  --aidl           run AIDL interface search only"
+    echo "Usage: $0 <workspace_dir> [--components] [--aidl] [--ignore-registered]"
+    echo "  <workspace_dir>       firmware dump directory (contains packages/ etc.)"
+    echo "  --components          run component accessibility analysis only"
+    echo "  --aidl                run AIDL interface search only"
+    echo "  --ignore-registered   output all AIDL interfaces (default: only registered services)"
     echo "  (default: run both)"
     exit 1
 fi
 
-JAVA_OPTS="${JAVA_OPTS:--Xmx32g}"
+JAVA_OPTS="${JAVA_OPTS:--Xmx4g}"
 exec java $JAVA_OPTS -jar "$JAR_PATH" "$@"
