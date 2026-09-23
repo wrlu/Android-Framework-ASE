@@ -10,8 +10,11 @@ import java.io.File;
 import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -26,15 +29,58 @@ public class AidlSearcher {
     private static final Pattern PROBE_FIELD = Pattern.compile("(\\w+)=([^,]*)");
 
     public void search(Workspace ws, boolean ignoreRegistered) throws IOException {
+        List<File> targetFiles = new ArrayList<>();
+
+        // 1. Framework files in packages/android
         File frameworkDir = new File(ws.getPackagesDir(), "android");
-        if (!frameworkDir.isDirectory()) {
-            logger.warn("packages/android not found, skip AIDL search.");
+        if (frameworkDir.isDirectory()) {
+            File[] files = frameworkDir.listFiles();
+            if (files != null) {
+                for (File f : files) {
+                    if (JadxInstance.isAndroidFile(f.getName()) && !Files.isSymbolicLink(f.toPath())) {
+                        targetFiles.add(f);
+                    }
+                }
+            }
+        } else {
+            logger.warn("packages/android not found.");
+        }
+
+        // 2. APEX javalib JARs (skip symlinks / Finder aliases / 替身 to prevent duplicate scanning)
+        File apexDir = ws.getApexDir();
+        if (apexDir.isDirectory()) {
+            File[] apexEntries = apexDir.listFiles();
+            if (apexEntries != null) {
+                Arrays.sort(apexEntries, Comparator.comparing(File::getName));
+                for (File entry : apexEntries) {
+                    if (Files.isSymbolicLink(entry.toPath()) || !entry.isDirectory()) {
+                        continue;
+                    }
+                    File javalibDir = new File(entry, "javalib");
+                    if (javalibDir.isDirectory()) {
+                        File[] jars = javalibDir.listFiles();
+                        if (jars != null) {
+                            for (File jar : jars) {
+                                if (JadxInstance.isAndroidFile(jar.getName()) && !Files.isSymbolicLink(jar.toPath())) {
+                                    targetFiles.add(jar);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (targetFiles.isEmpty()) {
+            logger.warn("No Android framework or APEX files found, skip AIDL search.");
             return;
         }
 
+        logger.info("Total framework & APEX target files to scan: {}", targetFiles.size());
+
         File outputFile = ws.getOutputFile("service_aidl.txt");
-        JadxInstance instance = new JadxInstance(frameworkDir.getAbsolutePath());
-        instance.loadDir();
+        JadxInstance instance = new JadxInstance(targetFiles);
+        instance.load();
         try {
             List<String> aidlClasses = instance.searchAidlClasses();
             if (aidlClasses == null || aidlClasses.isEmpty()) {

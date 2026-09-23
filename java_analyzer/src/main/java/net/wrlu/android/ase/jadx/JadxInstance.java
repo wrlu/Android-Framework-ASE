@@ -18,6 +18,7 @@ public class JadxInstance {
     private static final Logger logger = LoggerFactory.getLogger(JadxInstance.class);
     private JadxDecompiler decompiler;
     private final String filePath;
+    private final List<File> fileList;
     private final Map<String, AidlClass> aidlCacheMap = new HashMap<>();
 
     private List<JavaClass> allClasses;
@@ -25,9 +26,19 @@ public class JadxInstance {
 
     public JadxInstance(String path) {
         this.filePath = path;
+        this.fileList = null;
+    }
+
+    public JadxInstance(List<File> fileList) {
+        this.filePath = null;
+        this.fileList = fileList;
     }
 
     public void load() {
+        if (fileList != null) {
+            realLoad(fileList);
+            return;
+        }
         File file = new File(filePath);
         if (!file.exists() || !file.isFile()) {
             logger.error("Invalid file path: {}", file.getAbsolutePath());
@@ -37,6 +48,10 @@ public class JadxInstance {
     }
 
     public void loadDir() {
+        if (fileList != null) {
+            realLoad(fileList);
+            return;
+        }
         File dir = new File(filePath);
         if (!dir.exists() || !dir.isDirectory()) {
             logger.error("Invalid directory path: {}", dir.getAbsolutePath());
@@ -209,7 +224,7 @@ public class JadxInstance {
         classSearcher = null;
     }
 
-    private static boolean isAndroidFile(String path) {
+    public static boolean isAndroidFile(String path) {
         return path.endsWith(".apk") ||
                 path.endsWith(".dex") ||
                 path.endsWith(".jar");
