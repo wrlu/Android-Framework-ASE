@@ -258,7 +258,7 @@ def extract_elf_metadata(data):
         meta['is_legacy'] = True
     if any(s in data for s in [b'AIBinder_Class_define', b'AServiceManager_addService', b'AServiceManager_registerLazyService']):
         meta['has_ndk_server'] = True
-    if any(s in data for s in [b'defaultServiceManager', b'_ZN7android14IPCThreadState']):
+    if any(s in data for s in [b'addService', b'publishBinderService', b'_ZN7android14IPCThreadState']):
         meta['has_legacy_server'] = True
     if re.search(rb'[0-9a-f]{64}', data) or (b'notfrozen' in data):
         meta['has_interface_hash'] = True
@@ -397,29 +397,28 @@ def scan_so(so_path, registered_descriptors=None):
         bp_pat = '{}{}'.format(len(bp_str), bp_str).encode('ascii')
 
         # Direct symbol check (Itanium ABI C++ / Rust mangling)
-        has_bn = (bn_pat in data) or (b'Bn' + short_name.encode('ascii') in data)
-        has_bp = (bp_pat in data) or (b'Bp' + short_name.encode('ascii') in data)
+        has_bn = (
+            (bn_pat in data) or
+            (b'Bn' + short_name.encode('ascii') + b'::' in data) or
+            (b'Bn' + short_name.encode('ascii') + b'\x00' in data)
+        )
+        has_bp = (
+            (bp_pat in data) or
+            (b'Bp' + short_name.encode('ascii') + b'::' in data) or
+            (b'Bp' + short_name.encode('ascii') + b'\x00' in data)
+        )
 
         is_server = has_bn or (desc in rust_servers)
         is_client = has_bp
 
         # Stable AIDL / NDK Server heuristics (handles stripped / -fno-rtti binaries):
-        if not is_server and (elf_meta['is_ndk'] or elf_meta['has_ndk_server']):
-            if elf_meta['has_ndk_server']:
-                # The binary imports AIBinder_Class_define or AServiceManager_addService
-                is_server = True
-            elif registered_descriptors and desc in registered_descriptors:
-                # Registered service in service_list.txt and linked with libbinder_ndk
+        if not is_server and elf_meta['has_ndk_server']:
+            if registered_descriptors and desc in registered_descriptors:
                 is_server = True
 
         # Legacy libbinder server heuristics (handles stripped binaries):
         if not is_server and elf_meta['is_legacy'] and elf_meta['has_legacy_server']:
             if registered_descriptors and desc in registered_descriptors:
-                is_server = True
-
-        # Fallback for registered services in binaries with binder dependencies
-        if not is_server and registered_descriptors and desc in registered_descriptors:
-            if elf_meta['is_ndk'] or elf_meta['is_legacy']:
                 is_server = True
 
         # Client heuristics
@@ -493,6 +492,37 @@ def load_java_aidl_methods(workspace):
             elif curr_desc and line.startswith(curr_desc + '.'):
                 methods_by_desc[curr_desc].append(line)
     return methods_by_desc
+
+
+def load_java_server_descriptors(workspace):
+    """Load descriptors that have non-null Java server implementations.
+
+    Checks accessible_service_aidl.txt (or service_aidl.txt if the former is absent).
+    Entries with non-null implementations (e.g. [com.android.server...]) are considered
+    Java services, whereas entries with [null] are omitted.
+
+    Returns:
+        set: set of descriptors implemented by Java servers.
+    """
+    java_file = Path(workspace) / 'accessible_service_aidl.txt'
+    if not java_file.exists():
+        java_file = Path(workspace) / 'service_aidl.txt'
+    if not java_file.exists():
+        return set()
+
+    java_servers = set()
+    with open(java_file, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#') or '[' not in line:
+                continue
+            m = re.match(r'^([^\s\[]+)\s+\[([^\]]*)\]', line)
+            if m:
+                desc = m.group(1).strip()
+                impl = m.group(2).strip()
+                if impl and impl not in ('null', 'None'):
+                    java_servers.add(desc)
+    return java_servers
 
 
 def demangle_symbols(symbols):
@@ -788,17 +818,19 @@ def analyze(workspace, ignore_registered):
 
     # Accessible subset -> separate output (clean format); original file keeps markers.
     if accessible is not None:
+        java_servers = load_java_server_descriptors(workspace)
         accessible_ifaces = {d: info for d, info in server_ifaces.items()
-                             if accessible.get(d) is True}
+                             if accessible.get(d) is True and d not in java_servers}
         accessible_file = workspace / 'accessible_native_aidl.txt'
         write_native_aidl(accessible_file, accessible_ifaces, desc_to_names=desc_to_names,
                           desc_backends=desc_backends, desc_on_transact=desc_on_transact,
                           desc_methods=desc_methods)
         not_accessible = sum(1 for d in server_ifaces if accessible.get(d) is False)
         unknown = sum(1 for d in server_ifaces if d not in accessible)
+        filtered_java = sum(1 for d in server_ifaces if accessible.get(d) is True and d in java_servers)
         logger.info('Accessible output: %s', accessible_file)
-        logger.info('Accessibility verification: accessible=%d not_accessible=%d unknown=%d',
-                    len(accessible_ifaces), not_accessible, unknown)
+        logger.info('Accessibility verification: accessible=%d (filtered_java_servers=%d) not_accessible=%d unknown=%d',
+                    len(accessible_ifaces), filtered_java, not_accessible, unknown)
 
 
 def write_native_aidl(output_file, server_ifaces, accessible=None, desc_to_names=None,
