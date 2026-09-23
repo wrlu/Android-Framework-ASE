@@ -5,6 +5,7 @@ Android 固件攻击面分析工具，覆盖「固件采集 → 静态分析 →
 - **collector** — 通过 adb dump 固件（APK / APEX / 二进制 / SELinux / init 等）与运行元数据
 - **java_analyzer** — 基于 JADX 分析 Java 层导出组件权限与 AIDL 接口
 - **native_analyzer** — 扫描 .so 中的 Native AIDL 接口
+- **post_analyzer** — 比对实机可访问服务与静态分析结果，提取未匹配 AIDL 的盲区服务差集
 - **AttackSurfaceExplorer** — 设备端 APK，实机探测 binder 服务能否被获取
 
 ## 目录结构
@@ -23,6 +24,8 @@ Android 固件攻击面分析工具，覆盖「固件采集 → 静态分析 →
 │       └── workspace/
 ├── native_analyzer/
 │   └── native_analyzer.py         # Native AIDL 扫描
+├── post_analyzer/
+│   └── post_analyzer.py           # 后处理：求差集与盲区服务分析
 └── AttackSurfaceExplorer/         # 设备端 Binder 探测与动态执行 APK
     ├── runner.py                  # 主机端动态脚本编译与执行工具
     ├── sample_scripts/            # 验证脚本示例
@@ -37,7 +40,7 @@ Android 固件攻击面分析工具，覆盖「固件采集 → 静态分析 →
 
 | 依赖 | 版本 | 用途 |
 |------|------|------|
-| Python | 3.8+ | collector、native_analyzer |
+| Python | 3.8+ | collector、native_analyzer、post_analyzer |
 | adb | 1.0.41+ | collector |
 | JDK | 21+ | java_analyzer |
 | Gradle | 8.5+ | java_analyzer（仓库自带 wrapper） |
@@ -146,20 +149,20 @@ JVM 默认 `-XX:MaxRAMPercentage=50.0`（分配当前设备内存的 50%），�
 
 | 输出 | 说明 |
 |------|------|
-| `service_aidl.txt` | 每个接口一行 `接口名 [实现类]`，后跟方法签名；存在 `accessible_services.txt` 时头部追加 `[accessible=1\|0\|unknown]` |
-| `accessible_service_aidl.txt` | 仅 `accessible=1` 的接口子集（无标记，存在 `accessible_services.txt` 时生成） |
+| `service_aidl.txt` | 每个接口一行 `接口名 [实现类] [service=服务名]`，后跟方法签名；存在 `accessible_services.txt` 时追加 `[accessible=1\|0\|unknown]` |
+| `accessible_service_aidl.txt` | 仅 `accessible=1` 的接口子集（包含 `[service=服务名]`，无 accessible 标记） |
 
 ```
 # service_aidl.txt
-android.app.ILocaleManager [com.android.server.locales.LocaleManagerService.LocaleManagerBinderService] [accessible=1]
-android.os.IRecoverySystem [com.android.server.recoverysystem.RecoverySystemService] [accessible=0]
+android.app.ILocaleManager [com.android.server.locales.LocaleManagerService.LocaleManagerBinderService] [service=locale] [accessible=1]
+android.os.IRecoverySystem [com.android.server.recoverysystem.RecoverySystemService] [service=recovery] [accessible=0]
 
 # accessible_service_aidl.txt
-android.app.ILocaleManager [com.android.server.locales.LocaleManagerService.LocaleManagerBinderService]
+android.app.ILocaleManager [com.android.server.locales.LocaleManagerService.LocaleManagerBinderService] [service=locale]
 android.app.ILocaleManager.getApplicationLocales(java.lang.String, int):android.os.LocaleList
 ```
 
-`accessible_services.txt` 以服务名记录，分析时通过 `service_list.txt` 的 `服务名 → descriptor` 映射回 AIDL 接口。
+`accessible_services.txt` 以服务名记录，分析时通过 `service_list.txt` 的 `服务名 → descriptor` 映射回 AIDL 接口并记录对应服务名。
 
 ## 阶段 3：Native AIDL 分析（native_analyzer）
 
@@ -176,20 +179,41 @@ python3 native_analyzer.py <workspace_dir> [--ignore-registered]
 
 | 输出 | 说明 |
 |------|------|
-| `native_aidl.txt` | `descriptor [so_path]`，多个 .so 以逗号分隔；存在 `accessible_services.txt` 时追加 `[accessible=1\|0\|unknown]` |
-| `accessible_native_aidl.txt` | 仅 `accessible=1` 的 server 子集（无标记，存在 `accessible_services.txt` 时生成） |
+| `native_aidl.txt` | `descriptor [so_path] [service=服务名]`，多个 .so 以逗号分隔；存在 `accessible_services.txt` 时追加 `[accessible=1\|0\|unknown]` |
+| `accessible_native_aidl.txt` | 仅 `accessible=1` 的 server 子集（包含 `[service=服务名]`，无 accessible 标记） |
 
 ```
 # native_aidl.txt
-android.gui.ISurfaceComposer [system/lib64/libandroid_gui.dylib.so] [accessible=1]
+android.gui.ISurfaceComposer [system/lib64/libgui.so] [service=SurfaceFlinger, SurfaceFlingerAIDL] [accessible=1]
 android.app.IActivityManagerStructured [system/lib64/libactivitymanager_structured_aidl.dylib.so] [accessible=0]
 
 # accessible_native_aidl.txt
-android.gui.ISurfaceComposer [system/lib64/libandroid_gui.dylib.so]
-android.system.keystore2.IKeystoreService [system/lib64/android.system.keystore2-V6-ndk.so]
+android.gui.ISurfaceComposer [system/lib64/libgui.so] [service=SurfaceFlinger, SurfaceFlingerAIDL]
+android.system.keystore2.IKeystoreService [system/lib64/android.system.keystore2-V6-ndk.so] [service=android.system.keystore2]
 ```
 
-## 阶段 4：设备端 Binder 探测（AttackSurfaceExplorer）
+## 阶段 4：后处理分析（post_analyzer）
+
+```bash
+cd post_analyzer
+python3 post_analyzer.py <workspace_dir> [-o <output_file>]
+```
+
+自动比对实机可访问服务列表（`accessible_services.txt`）与 Java/Native 静态分析已解析的 AIDL 接口（`accessible_service_aidl.txt` 与 `accessible_native_aidl.txt`），执行差集运算，提取所有低权限可达但未能还原出 AIDL 实现的“盲区服务”：
+
+| 输出 | 说明 |
+|------|------|
+| `unresolved_accessible_services.txt` | 实机可达但未匹配到 Java/Native AIDL 实现的服务列表，包含服务名、Descriptor 及原因（`no_aidl_matched` 或 `empty_descriptor`） |
+
+```
+# unresolved_accessible_services.txt
+media.camera [android.hardware.ICameraService] [no_aidl_matched]
+vendor.custom.daemon [] [empty_descriptor]
+```
+
+这些服务通常为**手写 Raw BBinder 实现（无标准 AIDL 接口）**、**Descriptor 为空的匿名服务**、或**实现在未扫描系统 App / APEX 中**，是安全研究员进行针对性人工逆向和动态测试（如使用 `runner.py`）的高价值目标。
+
+## 阶段 5：设备端 Binder 探测（AttackSurfaceExplorer）
 
 静态分析只能判断接口存在，无法判断实机上能否真正拿到 binder 句柄。AttackSurfaceExplorer 以 **APK 自身 uid/权限** 通过 `android.os.ServiceManager` 获取服务，仅探测能否取到 `IBinder`——不读取 descriptor，也不调用 AIDL 方法。
 
@@ -320,6 +344,9 @@ cd ../java_analyzer && ./gradlew shadowJar && ./analyzer.sh ~/firmware/pixel8
 
 # 3. Native AIDL 分析
 cd ../native_analyzer && python3 native_analyzer.py ~/firmware/pixel8
+
+# 4. 后处理（求差集，输出未匹配的实机可达服务）
+cd ../post_analyzer && python3 post_analyzer.py ~/firmware/pixel8
 ```
 
 ## 输出文件
@@ -332,8 +359,9 @@ cd ../native_analyzer && python3 native_analyzer.py ~/firmware/pixel8
 ├── accessible_services.txt         # 采集：实机可达服务
 ├── all_comp.json                   # 组件分析
 ├── accessible_comp.json            # 组件分析：问题组件
-├── service_aidl.txt                # Java AIDL
-├── accessible_service_aidl.txt     # Java AIDL：accessible 子集
-├── native_aidl.txt                 # Native AIDL
-└── accessible_native_aidl.txt      # Native AIDL：accessible 子集
+├── service_aidl.txt                   # Java AIDL（含 [service=...] 标注）
+├── accessible_service_aidl.txt        # Java AIDL：accessible 子集
+├── native_aidl.txt                    # Native AIDL（含 [service=...] 标注）
+├── accessible_native_aidl.txt         # Native AIDL：accessible 子集
+└── unresolved_accessible_services.txt # 后处理：未匹配 AIDL 的可达服务差集
 ```
