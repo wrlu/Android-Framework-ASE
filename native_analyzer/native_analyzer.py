@@ -13,8 +13,10 @@ import os
 import re
 import sys
 import struct
+import shutil
 import logging
 import argparse
+import subprocess
 from collections import defaultdict
 from pathlib import Path
 
@@ -239,6 +241,7 @@ def extract_elf_metadata(data):
         'needed': set(),
         'imported': set(),
         'exported': set(),
+        'symbols': {},
         'is_ndk': False,
         'is_legacy': False,
         'has_ndk_server': False,
@@ -337,6 +340,7 @@ def extract_elf_metadata(data):
                                         meta['has_ndk_server'] = True
                                 else:
                                     meta['exported'].add(sym_name)
+                                    meta['symbols'][sym_name] = st_val
     except Exception:
         pass
 
@@ -376,7 +380,7 @@ def scan_so(so_path, registered_descriptors=None):
     descriptors.update(rust_servers)
 
     if not descriptors:
-        return {}
+        return {}, {}
 
     # Step 3: For each descriptor, check Bn/Bp presence and backend classification
     result = {}
@@ -439,7 +443,190 @@ def scan_so(so_path, registered_descriptors=None):
             'backend': backend,
         }
 
-    return result
+    return result, elf_meta['symbols']
+
+
+def parse_itanium_tokens(sym):
+    """Parse length-prefixed identifiers from Itanium C++ ABI mangled name."""
+    idx = sym.find('_ZN')
+    if idx != -1:
+        idx += 3
+    else:
+        return []
+    tokens = []
+    sym_len = len(sym)
+    while idx < sym_len:
+        if not sym[idx].isdigit():
+            break
+        j = idx
+        while j < sym_len and sym[j].isdigit():
+            j += 1
+        n = int(sym[idx:j])
+        token = sym[j:j+n]
+        tokens.append(token)
+        idx = j + n
+    return tokens
+
+
+def load_java_aidl_methods(workspace):
+    """Parse method signatures from service_aidl.txt in workspace (Scheme 2).
+
+    Returns:
+        dict: descriptor -> list of method lines
+    """
+    aidl_file = Path(workspace) / 'service_aidl.txt'
+    if not aidl_file.exists():
+        return {}
+
+    methods_by_desc = defaultdict(list)
+    curr_desc = None
+    with open(aidl_file, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                curr_desc = None
+                continue
+            if line.startswith('#'):
+                continue
+            if '[' in line:
+                curr_desc = line.split('[')[0].strip()
+            elif curr_desc and line.startswith(curr_desc + '.'):
+                methods_by_desc[curr_desc].append(line)
+    return methods_by_desc
+
+
+def demangle_symbols(symbols):
+    """Demangle a list of C++ symbol names using c++filt or llvm-cxxfilt if available."""
+    if not symbols:
+        return {}
+    cfilt = shutil.which('c++filt') or shutil.which('llvm-cxxfilt')
+    if cfilt:
+        try:
+            proc = subprocess.Popen(
+                [cfilt],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            out, _ = proc.communicate('\n'.join(symbols))
+            demangled_lines = out.splitlines()
+            res = {}
+            for sym, dem in zip(symbols, demangled_lines):
+                res[sym] = dem
+            for sym in symbols:
+                if sym not in res:
+                    res[sym] = sym
+            return res
+        except Exception as e:
+            logger.debug('c++filt failed: %s', e)
+    return {s: s for s in symbols}
+
+
+def extract_cpp_methods(desc, short_name, relevant_sos, so_symbols):
+    """Extract C++ method signatures from ELF dynamic symbols for pure native services (Scheme 1).
+
+    Returns:
+        list of str: formatted method lines (e.g. ['desc.method(args)', ...])
+    """
+    bp_str = 'Bp' + short_name
+    default_str = 'I' + short_name + 'Default'
+
+    candidates = set()
+    for rel_so in relevant_sos:
+        symbols = so_symbols.get(rel_so, {})
+        for sym in symbols.keys():
+            if bp_str in sym or default_str in sym:
+                candidates.add(sym)
+
+    if not candidates:
+        return []
+
+    demangled_map = demangle_symbols(list(candidates))
+
+    method_pattern = re.compile(rf'(?:Bp{short_name}|I{short_name}Default)::(\w+)\((.*)\)')
+    methods = []
+    seen = set()
+
+    for mangled, demangled in demangled_map.items():
+        if any(tok in demangled for tok in ('~', 'vtable', 'typeinfo', 'thunk', 'VTT', 'construction vtable')):
+            continue
+        m = method_pattern.search(demangled)
+        if not m:
+            continue
+        name, args = m.group(1), m.group(2)
+        if name in (f'Bp{short_name}', f'I{short_name}Default', 'asBinder', 'createBinder',
+                    'fromBinder', 'getInterfaceVersion', 'getInterfaceHash',
+                    'getInterfaceDescriptor', 'isRemote', 'onTransact', 'dump'):
+            continue
+        if name.startswith('operator'):
+            continue
+
+        # Clean C++ standard library types for readability
+        args_clean = args.replace('std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>', 'std::string')
+        args_clean = args_clean.replace('std::__1::', 'std::')
+        args_clean = re.sub(r'std::vector<([^,]+),\s*std::allocator<[^>]+>\s*>', r'std::vector<\1>', args_clean)
+
+        sig = f'{desc}.{name}({args_clean})'
+        if sig not in seen:
+            seen.add(sig)
+            methods.append(sig)
+
+    return sorted(methods)
+
+
+def locate_on_transact(desc, short_name, server_sos, so_symbols):
+    """Locate onTransact function virtual address / offset for a native interface.
+
+    Returns:
+        str: Comma-separated hex addresses if found, or None.
+    """
+    bn_str = 'Bn' + short_name
+    bn_pat = f'{len(bn_str)}{bn_str}'
+    pkg_parts = set(desc.split('.')[:-1])
+
+    addresses = []
+    seen_addrs = set()
+
+    for rel_so in sorted(server_sos):
+        symbols = so_symbols.get(rel_so, {})
+        matches = []
+        for sym, addr in symbols.items():
+            if sym.startswith('_ZThn'):  # Skip non-virtual thunks
+                continue
+            # Check Itanium C++: Bn{short_name} and 10onTransact
+            # Or Rust: Bn{short_name} and on_transact
+            if bn_pat in sym and ('10onTransact' in sym or 'on_transact' in sym):
+                matches.append((addr, sym))
+
+        if not matches:
+            continue
+
+        if len(matches) > 1:
+            # Score matches based on package namespace match
+            scored = []
+            for addr, sym in matches:
+                tokens = parse_itanium_tokens(sym)
+                score = 0
+                for t in tokens:
+                    if t.startswith('Bn') or t in ('onTransact', 'on_transact'):
+                        continue
+                    if t in pkg_parts:
+                        score += 10
+                    else:
+                        score -= 5
+                scored.append((score, addr, sym))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            best_addr = scored[0][1]
+        else:
+            best_addr = matches[0][0]
+
+        hex_addr = f'0x{best_addr:x}'
+        if hex_addr not in seen_addrs:
+            seen_addrs.add(hex_addr)
+            addresses.append(hex_addr)
+
+    return ', '.join(addresses) if addresses else None
 
 
 def parse_service_list(workspace):
@@ -536,13 +723,16 @@ def analyze(workspace, ignore_registered):
 
     # Map: descriptor -> {'servers': set(so_paths), 'clients': set(so_paths), 'backends': set()}
     aidl_map = defaultdict(lambda: {'servers': set(), 'clients': set(), 'backends': set()})
+    so_symbols = {}
 
     total = len(elf_files)
     for i, so_path in enumerate(elf_files, 1):
         rel_path = str(so_path.relative_to(workspace))
         logger.info('[%d/%d] %s', i, total, rel_path)
 
-        results = scan_so(so_path, registered)
+        results, symbols = scan_so(so_path, registered)
+        if results:
+            so_symbols[rel_path] = symbols
         for desc, info in results.items():
             if info['server']:
                 aidl_map[desc]['servers'].add(rel_path)
@@ -558,13 +748,40 @@ def analyze(workspace, ignore_registered):
     if not ignore_registered:
         server_ifaces = {desc: info for desc, info in server_ifaces.items() if desc in registered}
 
+    # Load Java AIDL method definitions from service_aidl.txt (Scheme 2)
+    java_methods = load_java_aidl_methods(workspace)
+
     desc_backends = {
         desc: ', '.join(sorted(info['backends'])) if info['backends'] else 'unknown'
         for desc, info in server_ifaces.items()
     }
 
+    # Locate onTransact and extract method signatures for each server interface
+    desc_on_transact = {}
+    desc_methods = {}
+    for desc, info in server_ifaces.items():
+        iface_full = desc.rsplit('.', 1)[-1]
+        if iface_full.startswith('I') and len(iface_full) > 1 and iface_full[1].isupper():
+            short_name = iface_full[1:]
+        else:
+            short_name = iface_full
+
+        on_transact_addr = locate_on_transact(desc, short_name, info['servers'], so_symbols)
+        if on_transact_addr:
+            desc_on_transact[desc] = on_transact_addr
+
+        if desc in java_methods and java_methods[desc]:
+            desc_methods[desc] = java_methods[desc]
+        else:
+            relevant_sos = info['servers'] | info['clients']
+            cpp_methods = extract_cpp_methods(desc, short_name, relevant_sos, so_symbols)
+            if cpp_methods:
+                desc_methods[desc] = cpp_methods
+
     output_file = workspace / 'native_aidl.txt'
-    write_native_aidl(output_file, server_ifaces, accessible, desc_to_names=desc_to_names, desc_backends=desc_backends)
+    write_native_aidl(output_file, server_ifaces, accessible, desc_to_names=desc_to_names,
+                      desc_backends=desc_backends, desc_on_transact=desc_on_transact,
+                      desc_methods=desc_methods)
     logger.info('Output: %s', output_file)
     logger.info('Total: %d server implementations', len(server_ifaces))
 
@@ -573,7 +790,9 @@ def analyze(workspace, ignore_registered):
         accessible_ifaces = {d: info for d, info in server_ifaces.items()
                              if accessible.get(d) is True}
         accessible_file = workspace / 'accessible_native_aidl.txt'
-        write_native_aidl(accessible_file, accessible_ifaces, desc_to_names=desc_to_names, desc_backends=desc_backends)
+        write_native_aidl(accessible_file, accessible_ifaces, desc_to_names=desc_to_names,
+                          desc_backends=desc_backends, desc_on_transact=desc_on_transact,
+                          desc_methods=desc_methods)
         not_accessible = sum(1 for d in server_ifaces if accessible.get(d) is False)
         unknown = sum(1 for d in server_ifaces if d not in accessible)
         logger.info('Accessible output: %s', accessible_file)
@@ -581,7 +800,8 @@ def analyze(workspace, ignore_registered):
                     len(accessible_ifaces), not_accessible, unknown)
 
 
-def write_native_aidl(output_file, server_ifaces, accessible=None, desc_to_names=None, desc_backends=None):
+def write_native_aidl(output_file, server_ifaces, accessible=None, desc_to_names=None,
+                      desc_backends=None, desc_on_transact=None, desc_methods=None):
     with open(output_file, 'w') as f:
         for desc in sorted(server_ifaces.keys()):
             so_list = ', '.join(sorted(server_ifaces[desc]['servers']))
@@ -591,12 +811,18 @@ def write_native_aidl(output_file, server_ifaces, accessible=None, desc_to_names
                 line += ' [service={}]'.format(svc_names)
             if desc_backends and desc in desc_backends:
                 line += ' [backend={}]'.format(desc_backends[desc])
+            if desc_on_transact and desc in desc_on_transact and desc_on_transact[desc]:
+                line += ' [onTransact={}]'.format(desc_on_transact[desc])
             if accessible is not None:
                 if desc in accessible:
                     line += ' [accessible={}]'.format(1 if accessible[desc] else 0)
                 else:
                     line += ' [accessible=unknown]'
             f.write(line + '\n')
+            if desc_methods and desc in desc_methods:
+                for method in desc_methods[desc]:
+                    f.write(method + '\n')
+            f.write('\n')
 
 
 def main():

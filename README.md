@@ -178,22 +178,27 @@ python3 native_analyzer.py <workspace_dir> [--ignore-registered]
 2. **多层服务端判定（解决 Strip 与 -fno-rtti 漏报）** — 结合 C++ Itanium ABI（`{len}Bn{Name}`）、Rust mangling、以及 ELF 动态符号表（`AIBinder_Class_define`、`AServiceManager_addService`、`defaultServiceManager` 等关键系统调用）；
 3. **技术栈架构识别（Backend）** — 基于 `DT_NEEDED` 依赖库与导出符号，自动分类为 `libbinder`（旧式私有 C++）、`ndk`（基于 `libbinder_ndk` 的 Stable AIDL）或 `rust`；
 4. **APEX 深度扫描与去重** — 自动覆盖 Android 10+ Mainline 模块，并在遍历时跳过软链接（Finder 替身），确保二进制去重且仅扫描真实实体；
-5. **service_list 交叉引用** — 默认仅保留已注册 descriptor，`--ignore-registered` 输出全部 server 接口。
+5. **service_list 交叉引用** — 默认仅保留已注册 descriptor，`--ignore-registered` 输出全部 server 接口；
+6. **AIDL 方法签名还原** — 自动交叉引用 Java 提取的 `service_aidl.txt`；对纯 Native 接口，解析 ELF 动态符号表中 `Bp{Name}` 客户端代理类导出符号，还原具体 AIDL 业务方法；
+7. **onTransact 入口定位** — 匹配服务端 `Bn{Name}::onTransact`（C++）或 `on_transact`（Rust）函数虚地址偏移，输出 `[onTransact=0x...]` 标记。
 
 | 输出 | 说明 |
 |------|------|
-| `native_aidl.txt` | `descriptor [so_path] [service=服务名] [backend=libbinder\|ndk\|rust]`，多个 .so 以逗号分隔；存在 `accessible_services.txt` 时追加 `[accessible=1\|0\|unknown]` |
-| `accessible_native_aidl.txt` | 仅 `accessible=1` 的 server 子集（包含 `[service=服务名]` 与 `[backend=...]`，无 accessible 标记） |
+| `native_aidl.txt` | `descriptor [so_path] [service=服务名] [backend=libbinder\|ndk\|rust] [onTransact=0x...]`，包含 AIDL 方法签名；存在 `accessible_services.txt` 时追加 `[accessible=1\|0\|unknown]` |
+| `accessible_native_aidl.txt` | 仅 `accessible=1` 的 server 子集（包含 `[service=服务名]`、`[backend=...]`、`[onTransact=0x...]` 与还原的 AIDL 方法，无 accessible 标记） |
 
 ```
 # native_aidl.txt
-android.gui.ISurfaceComposer [system/lib64/libgui.so] [service=SurfaceFlinger, SurfaceFlingerAIDL] [backend=libbinder] [accessible=1]
-android.hardware.test.ITestService [apex/com.android.test/lib64/libtest_ndk.so] [service=test_svc] [backend=ndk] [accessible=1]
-android.app.IActivityManagerStructured [system/lib64/libactivitymanager_structured_aidl.dylib.so] [backend=ndk] [accessible=0]
+android.gui.ISurfaceComposer [system/lib64/libgui.so] [service=SurfaceFlinger] [backend=libbinder] [onTransact=0xc6be0] [accessible=1]
+android.gui.ISurfaceComposer.bootFinished()
+android.gui.ISurfaceComposer.captureDisplay(android::gui::DisplayCaptureArgs const&, android::sp<android::gui::IScreenCaptureListener> const&)
 
 # accessible_native_aidl.txt
-android.gui.ISurfaceComposer [system/lib64/libgui.so] [service=SurfaceFlinger, SurfaceFlingerAIDL] [backend=libbinder]
-android.system.keystore2.IKeystoreService [apex/com.android.security.keystore2/bin/keystore2] [service=android.system.keystore2] [backend=rust]
+android.net.connectivity.aidl.ConnectivityNative [apex/com.google.android.tetherin/lib64/libcom.android.tethering.connectivity_native.so] [service=connectivity_native] [backend=ndk]
+android.net.connectivity.aidl.ConnectivityNative.blockPortForBind(int)
+android.net.connectivity.aidl.ConnectivityNative.getPortsBlockedForBind(std::vector<int>*)
+android.net.connectivity.aidl.ConnectivityNative.unblockAllPortsForBind()
+android.net.connectivity.aidl.ConnectivityNative.unblockPortForBind(int)
 ```
 
 ## 阶段 4：后处理分析（post_analyzer）
