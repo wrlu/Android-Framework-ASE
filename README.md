@@ -171,25 +171,28 @@ cd native_analyzer
 python3 native_analyzer.py <workspace_dir> [--ignore-registered]
 ```
 
-无需构建、无外部依赖。扫描各分区 `lib(64)` 下的 `.so` 与 `bin` 下的 ELF：
+无需构建、无外部依赖。扫描各分区 `lib(64)`、`bin`（含 `bin/hw`）以及 `apex/` 容器下的全部 ELF 二进制：
 
-1. **Descriptor 字符串** — 匹配 AIDL 名称模式（如 `android.frameworks.stats.IStats`），兼容 C++ 与 Rust v0 mangling；
-2. **Bn/Bp 符号** — 按 `{len}Bn{Name}` / `{len}Bp{Name}` 判定服务端 / 客户端实现；
-3. **service_list 交叉引用** — 默认仅保留已注册 descriptor，`--ignore-registered` 输出全部 server 接口。
+1. **Descriptor 提取** — 匹配 AIDL 字符串模式与 Rust v0 mangling 符号；
+2. **多层服务端判定（解决 Strip 与 -fno-rtti 漏报）** — 结合 C++ Itanium ABI（`{len}Bn{Name}`）、Rust mangling、以及 ELF 动态符号表（`AIBinder_Class_define`、`AServiceManager_addService`、`defaultServiceManager` 等关键系统调用）；
+3. **技术栈架构识别（Backend）** — 基于 `DT_NEEDED` 依赖库与导出符号，自动分类为 `libbinder`（旧式私有 C++）、`ndk`（基于 `libbinder_ndk` 的 Stable AIDL）或 `rust`；
+4. **APEX 深度扫描** — 自动覆盖 Android 10+ Mainline 模块（如 Keystore2、Bluetooth、WiFi 等）；
+5. **service_list 交叉引用** — 默认仅保留已注册 descriptor，`--ignore-registered` 输出全部 server 接口。
 
 | 输出 | 说明 |
 |------|------|
-| `native_aidl.txt` | `descriptor [so_path] [service=服务名]`，多个 .so 以逗号分隔；存在 `accessible_services.txt` 时追加 `[accessible=1\|0\|unknown]` |
-| `accessible_native_aidl.txt` | 仅 `accessible=1` 的 server 子集（包含 `[service=服务名]`，无 accessible 标记） |
+| `native_aidl.txt` | `descriptor [so_path] [service=服务名] [backend=libbinder\|ndk\|rust]`，多个 .so 以逗号分隔；存在 `accessible_services.txt` 时追加 `[accessible=1\|0\|unknown]` |
+| `accessible_native_aidl.txt` | 仅 `accessible=1` 的 server 子集（包含 `[service=服务名]` 与 `[backend=...]`，无 accessible 标记） |
 
 ```
 # native_aidl.txt
-android.gui.ISurfaceComposer [system/lib64/libgui.so] [service=SurfaceFlinger, SurfaceFlingerAIDL] [accessible=1]
-android.app.IActivityManagerStructured [system/lib64/libactivitymanager_structured_aidl.dylib.so] [accessible=0]
+android.gui.ISurfaceComposer [system/lib64/libgui.so] [service=SurfaceFlinger, SurfaceFlingerAIDL] [backend=libbinder] [accessible=1]
+android.hardware.test.ITestService [apex/com.android.test/lib64/libtest_ndk.so] [service=test_svc] [backend=ndk] [accessible=1]
+android.app.IActivityManagerStructured [system/lib64/libactivitymanager_structured_aidl.dylib.so] [backend=ndk] [accessible=0]
 
 # accessible_native_aidl.txt
-android.gui.ISurfaceComposer [system/lib64/libgui.so] [service=SurfaceFlinger, SurfaceFlingerAIDL]
-android.system.keystore2.IKeystoreService [system/lib64/android.system.keystore2-V6-ndk.so] [service=android.system.keystore2]
+android.gui.ISurfaceComposer [system/lib64/libgui.so] [service=SurfaceFlinger, SurfaceFlingerAIDL] [backend=libbinder]
+android.system.keystore2.IKeystoreService [apex/com.android.security.keystore2/bin/keystore2] [service=android.system.keystore2] [backend=rust]
 ```
 
 ## 阶段 4：后处理分析（post_analyzer）
