@@ -12,6 +12,7 @@ Combines:
 import os
 import re
 import sys
+import struct
 import logging
 import argparse
 from collections import defaultdict
@@ -38,6 +39,7 @@ SCAN_DIRS = [
     ('product/lib64', '*.so'),
     ('system_ext/lib', '*.so'),
     ('system_ext/lib64', '*.so'),
+    ('apex', '**/*.so'),
     ('system/bin', '*'),
     ('system/bin/hw', '*'),
     ('vendor/bin', '*'),
@@ -45,7 +47,10 @@ SCAN_DIRS = [
     ('odm/bin', '*'),
     ('odm/bin/hw', '*'),
     ('product/bin', '*'),
+    ('product/bin/hw', '*'),
     ('system_ext/bin', '*'),
+    ('system_ext/bin/hw', '*'),
+    ('apex', '**/bin/*'),
 ]
 
 ELF_MAGIC = b'\x7fELF'
@@ -54,6 +59,7 @@ ELF_MAGIC = b'\x7fELF'
 def find_elf_files(workspace):
     """Find all ELF files (.so and executables) in workspace directories."""
     elf_files = []
+    seen = set()
     for rel_dir, glob_pat in SCAN_DIRS:
         path = Path(workspace) / rel_dir
         if not path.is_dir():
@@ -61,10 +67,14 @@ def find_elf_files(workspace):
         for f in path.glob(glob_pat):
             if not f.is_file():
                 continue
+            resolved = f.resolve()
+            if resolved in seen:
+                continue
             try:
                 with open(f, 'rb') as fh:
                     if fh.read(4) == ELF_MAGIC:
-                        elf_files.append(f.resolve())
+                        elf_files.append(resolved)
+                        seen.add(resolved)
             except (IOError, OSError):
                 pass
     return elf_files
@@ -198,16 +208,133 @@ def parse_rust_length_prefixed(data):
     return components
 
 
-def scan_so(so_path):
+def extract_elf_metadata(data):
+    """Extract dynamic dependencies and symbols from ELF bytes.
+
+    Parses ELF header, PT_DYNAMIC, and section headers (SHT_DYNAMIC / SHT_DYNSYM)
+    when available, with fast byte scanning as resilient fallback.
+    """
+    meta = {
+        'needed': set(),
+        'imported': set(),
+        'exported': set(),
+        'is_ndk': False,
+        'is_legacy': False,
+        'has_ndk_server': False,
+        'has_legacy_server': False,
+        'has_interface_hash': False,
+    }
+    if len(data) < 52 or data[:4] != b'\x7fELF':
+        return meta
+
+    # Fast byte heuristics (resilient even if section headers are stripped)
+    if b'libbinder_ndk.so' in data:
+        meta['is_ndk'] = True
+    if b'libbinder.so' in data:
+        meta['is_legacy'] = True
+    if any(s in data for s in [b'AIBinder_Class_define', b'AServiceManager_addService', b'AServiceManager_registerLazyService']):
+        meta['has_ndk_server'] = True
+    if any(s in data for s in [b'defaultServiceManager', b'_ZN7android14IPCThreadState']):
+        meta['has_legacy_server'] = True
+    if re.search(rb'[0-9a-f]{64}', data) or (b'notfrozen' in data):
+        meta['has_interface_hash'] = True
+
+    ei_class = data[4]
+    endian = '<' if data[5] == 1 else '>'
+    is_64 = (ei_class == 2)
+
+    try:
+        if is_64:
+            e_phoff, e_shoff, e_flags, e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx = struct.unpack(
+                endian + 'QQIHHHHHH', data[32:64]
+            )
+            sh_fmt = endian + 'IIQQQQIIQQ'
+            sym_fmt = endian + 'IBBHQQ'
+            dyn_fmt = endian + 'qQ'
+            dyn_sz = 16
+            sym_sz = 24
+        else:
+            e_phoff, e_shoff, e_flags, e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx = struct.unpack(
+                endian + 'IIIHHHHHH', data[28:52]
+            )
+            sh_fmt = endian + 'IIIIIIIIII'
+            sym_fmt = endian + 'IIIBBH'
+            dyn_fmt = endian + 'iI'
+            dyn_sz = 8
+            sym_sz = 16
+
+        sections = []
+        if e_shoff > 0 and e_shnum > 0 and e_shoff + e_shnum * e_shentsize <= len(data):
+            for i in range(e_shnum):
+                off = e_shoff + i * e_shentsize
+                fields = struct.unpack(sh_fmt, data[off:off+e_shentsize])
+                sections.append(fields)
+
+        for sec in sections:
+            sh_type = sec[1]
+            if sh_type == 6:  # SHT_DYNAMIC
+                dyn_off, dyn_size, link = sec[4], sec[5], sec[6]
+                if 0 <= link < len(sections):
+                    str_sec = sections[link]
+                    strtab = data[str_sec[4]:str_sec[4]+str_sec[5]]
+                    for j in range(0, dyn_size, dyn_sz):
+                        if dyn_off + j + dyn_sz > len(data):
+                            break
+                        d_tag, d_val = struct.unpack(dyn_fmt, data[dyn_off+j:dyn_off+j+dyn_sz])
+                        if d_tag == 0:
+                            break
+                        if d_tag == 1:  # DT_NEEDED
+                            if d_val < len(strtab):
+                                end = strtab.find(b'\x00', d_val)
+                                if end != -1:
+                                    lib_name = strtab[d_val:end].decode('ascii', 'ignore')
+                                    meta['needed'].add(lib_name)
+                                    if lib_name == 'libbinder_ndk.so':
+                                        meta['is_ndk'] = True
+                                    elif lib_name == 'libbinder.so':
+                                        meta['is_legacy'] = True
+            elif sh_type == 11:  # SHT_DYNSYM
+                sym_off, sym_size, link = sec[4], sec[5], sec[6]
+                if 0 <= link < len(sections):
+                    str_sec = sections[link]
+                    strtab = data[str_sec[4]:str_sec[4]+str_sec[5]]
+                    for j in range(0, sym_size, sym_sz):
+                        if sym_off + j + sym_sz > len(data):
+                            break
+                        fields = struct.unpack(sym_fmt, data[sym_off+j:sym_off+j+sym_sz])
+                        if is_64:
+                            st_name, st_info, st_other, st_shndx, st_val, st_sz = fields
+                        else:
+                            st_name, st_val, st_sz, st_info, st_other, st_shndx = fields
+                        if st_name < len(strtab):
+                            end = strtab.find(b'\x00', st_name)
+                            if end != -1:
+                                sym_name = strtab[st_name:end].decode('ascii', 'ignore')
+                                if st_shndx == 0:
+                                    meta['imported'].add(sym_name)
+                                    if sym_name in ('AIBinder_Class_define', 'AServiceManager_addService', 'AServiceManager_registerLazyService'):
+                                        meta['has_ndk_server'] = True
+                                else:
+                                    meta['exported'].add(sym_name)
+    except Exception:
+        pass
+
+    return meta
+
+
+def scan_so(so_path, registered_descriptors=None):
     """Scan an ELF file for AIDL descriptors and Bn/Bp symbols.
 
     Returns:
-        dict: descriptor -> {'server': bool, 'client': bool}
+        dict: descriptor -> {'server': bool, 'client': bool, 'backend': str}
     """
     with open(so_path, 'rb') as f:
         data = f.read()
 
-    # Step 1: Find AIDL descriptors from null-separated strings (C++)
+    # Step 1: Extract ELF metadata (DT_NEEDED, dynamic symbols, binder backend)
+    elf_meta = extract_elf_metadata(data)
+
+    # Step 2: Find AIDL descriptors from null-separated strings (C++)
     descriptors = set()
     for m in AIDL_DESC_PATTERN.finditer(data):
         try:
@@ -217,14 +344,14 @@ def scan_so(so_path):
         except UnicodeDecodeError:
             pass
 
-    # Step 1b: Find AIDL descriptors from Rust v0 mangled symbols
-    descriptors.update(extract_rust_descriptors(data))
+    # Step 2b: Find AIDL descriptors from Rust v0 mangled symbols
+    rust_servers = extract_rust_descriptors(data)
+    descriptors.update(rust_servers)
 
     if not descriptors:
         return {}
 
-    # Step 2: For each descriptor, check Bn/Bp presence
-    # Both C++ (Itanium ABI) and Rust (v0) use {len}Bn{Name} byte encoding
+    # Step 3: For each descriptor, check Bn/Bp presence and backend classification
     result = {}
     for desc in descriptors:
         iface_full = desc.rsplit('.', 1)[-1]
@@ -237,9 +364,46 @@ def scan_so(so_path):
         bn_pat = '{}{}'.format(len(bn_str), bn_str).encode('ascii')
         bp_pat = '{}{}'.format(len(bp_str), bp_str).encode('ascii')
 
+        # Direct symbol check (Itanium ABI C++ / Rust mangling)
+        has_bn = (bn_pat in data) or (b'Bn' + short_name.encode('ascii') in data)
+        has_bp = (bp_pat in data) or (b'Bp' + short_name.encode('ascii') in data)
+
+        is_server = has_bn or (desc in rust_servers)
+        is_client = has_bp
+
+        # Stable AIDL / NDK Server heuristics (handles stripped / -fno-rtti binaries):
+        if not is_server and (elf_meta['is_ndk'] or elf_meta['has_ndk_server']):
+            if elf_meta['has_ndk_server']:
+                # The binary imports AIBinder_Class_define or AServiceManager_addService
+                is_server = True
+            elif registered_descriptors and desc in registered_descriptors:
+                # Registered service in service_list.txt and linked with libbinder_ndk
+                is_server = True
+
+        # Legacy libbinder server heuristics (handles stripped binaries):
+        if not is_server and elf_meta['is_legacy'] and elf_meta['has_legacy_server']:
+            if registered_descriptors and desc in registered_descriptors:
+                is_server = True
+
+        # Client heuristics
+        if not is_client:
+            if b'AIBinder_transact' in data or b'AServiceManager_getService' in data:
+                is_client = True
+
+        # Classify backend
+        if (desc in rust_servers) or (b'libbinder_rs' in data):
+            backend = 'rust'
+        elif elf_meta['is_ndk'] or elf_meta['has_ndk_server'] or (b'AIBinder_' in data):
+            backend = 'ndk'
+        elif elf_meta['is_legacy'] or elf_meta['has_legacy_server'] or (b'_ZN7android' in data):
+            backend = 'libbinder'
+        else:
+            backend = 'unknown'
+
         result[desc] = {
-            'server': bn_pat in data,
-            'client': bp_pat in data,
+            'server': is_server,
+            'client': is_client,
+            'backend': backend,
         }
 
     return result
@@ -327,22 +491,7 @@ def analyze(workspace, ignore_registered):
         logger.error('No ELF files found. Check workspace directory.')
         return
 
-    # Map: descriptor -> {'servers': set(so_paths), 'clients': set(so_paths)}
-    aidl_map = defaultdict(lambda: {'servers': set(), 'clients': set()})
-
-    total = len(elf_files)
-    for i, so_path in enumerate(elf_files, 1):
-        rel_path = str(so_path.relative_to(workspace))
-        logger.info('[%d/%d] %s', i, total, rel_path)
-
-        results = scan_so(so_path)
-        for desc, info in results.items():
-            if info['server']:
-                aidl_map[desc]['servers'].add(rel_path)
-            if info['client']:
-                aidl_map[desc]['clients'].add(rel_path)
-
-    # Registered filter: load service_list.txt unless ignored.
+    # Registered filter: load service_list.txt upfront to assist in server resolution.
     # Accessibility results (accessible_services.txt) drive a separate output.
     registered, name_to_desc, desc_to_names = parse_service_list(workspace)
     accessible = None
@@ -352,6 +501,23 @@ def analyze(workspace, ignore_registered):
     elif name_to_desc:
         accessible = load_accessible_services(workspace, name_to_desc)
 
+    # Map: descriptor -> {'servers': set(so_paths), 'clients': set(so_paths), 'backends': set()}
+    aidl_map = defaultdict(lambda: {'servers': set(), 'clients': set(), 'backends': set()})
+
+    total = len(elf_files)
+    for i, so_path in enumerate(elf_files, 1):
+        rel_path = str(so_path.relative_to(workspace))
+        logger.info('[%d/%d] %s', i, total, rel_path)
+
+        results = scan_so(so_path, registered)
+        for desc, info in results.items():
+            if info['server']:
+                aidl_map[desc]['servers'].add(rel_path)
+            if info['client']:
+                aidl_map[desc]['clients'].add(rel_path)
+            if info.get('backend') and info['backend'] != 'unknown':
+                aidl_map[desc]['backends'].add(info['backend'])
+
     # Only server entries
     server_ifaces = {desc: info for desc, info in aidl_map.items() if info['servers']}
 
@@ -359,8 +525,13 @@ def analyze(workspace, ignore_registered):
     if not ignore_registered:
         server_ifaces = {desc: info for desc, info in server_ifaces.items() if desc in registered}
 
+    desc_backends = {
+        desc: ', '.join(sorted(info['backends'])) if info['backends'] else 'unknown'
+        for desc, info in server_ifaces.items()
+    }
+
     output_file = workspace / 'native_aidl.txt'
-    write_native_aidl(output_file, server_ifaces, accessible, desc_to_names=desc_to_names)
+    write_native_aidl(output_file, server_ifaces, accessible, desc_to_names=desc_to_names, desc_backends=desc_backends)
     logger.info('Output: %s', output_file)
     logger.info('Total: %d server implementations', len(server_ifaces))
 
@@ -369,7 +540,7 @@ def analyze(workspace, ignore_registered):
         accessible_ifaces = {d: info for d, info in server_ifaces.items()
                              if accessible.get(d) is True}
         accessible_file = workspace / 'accessible_native_aidl.txt'
-        write_native_aidl(accessible_file, accessible_ifaces, desc_to_names=desc_to_names)
+        write_native_aidl(accessible_file, accessible_ifaces, desc_to_names=desc_to_names, desc_backends=desc_backends)
         not_accessible = sum(1 for d in server_ifaces if accessible.get(d) is False)
         unknown = sum(1 for d in server_ifaces if d not in accessible)
         logger.info('Accessible output: %s', accessible_file)
@@ -377,7 +548,7 @@ def analyze(workspace, ignore_registered):
                     len(accessible_ifaces), not_accessible, unknown)
 
 
-def write_native_aidl(output_file, server_ifaces, accessible=None, desc_to_names=None):
+def write_native_aidl(output_file, server_ifaces, accessible=None, desc_to_names=None, desc_backends=None):
     with open(output_file, 'w') as f:
         for desc in sorted(server_ifaces.keys()):
             so_list = ', '.join(sorted(server_ifaces[desc]['servers']))
@@ -385,6 +556,8 @@ def write_native_aidl(output_file, server_ifaces, accessible=None, desc_to_names
             if desc_to_names and desc in desc_to_names:
                 svc_names = ', '.join(sorted(set(desc_to_names[desc])))
                 line += ' [service={}]'.format(svc_names)
+            if desc_backends and desc in desc_backends:
+                line += ' [backend={}]'.format(desc_backends[desc])
             if accessible is not None:
                 if desc in accessible:
                     line += ' [accessible={}]'.format(1 if accessible[desc] else 0)
