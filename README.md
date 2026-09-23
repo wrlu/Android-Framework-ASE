@@ -189,16 +189,16 @@ python3 native_analyzer.py <workspace_dir> [--ignore-registered]
 
 ```
 # native_aidl.txt
-android.gui.ISurfaceComposer [system/lib64/libgui.so] [service=SurfaceFlinger] [backend=libbinder] [onTransact=0xc6be0] [accessible=1]
-android.gui.ISurfaceComposer.bootFinished()
-android.gui.ISurfaceComposer.captureDisplay(android::gui::DisplayCaptureArgs const&, android::sp<android::gui::IScreenCaptureListener> const&)
+android.ui.ISurfaceComposer [system/lib64/libgui.so] [service=SurfaceFlinger] [backend=libbinder] [onTransact=0xc6be0] [accessible=1]
+0xf80d0: android::gui::BpSurfaceComposer::addJankListener(android::sp<android::IBinder> const&, android::sp<android::gui::IJankListener> const&)
+0xf8570: android::gui::BpSurfaceComposer::captureDisplay(android::gui::DisplayCaptureArgs const&, android::sp<android::gui::IScreenCaptureListener> const&)
 
 # accessible_native_aidl.txt
 android.net.connectivity.aidl.ConnectivityNative [apex/com.google.android.tetherin/lib64/libcom.android.tethering.connectivity_native.so] [service=connectivity_native] [backend=ndk]
-android.net.connectivity.aidl.ConnectivityNative.blockPortForBind(int)
-android.net.connectivity.aidl.ConnectivityNative.getPortsBlockedForBind(std::vector<int>*)
-android.net.connectivity.aidl.ConnectivityNative.unblockAllPortsForBind()
-android.net.connectivity.aidl.ConnectivityNative.unblockPortForBind(int)
+0x8e00: aidl::android::net::connectivity::aidl::BpConnectivityNative::blockPortForBind(int)
+0x8ee8: aidl::android::net::connectivity::aidl::BpConnectivityNative::unblockPortForBind(int)
+0x9b64: aidl::android::net::connectivity::aidl::IConnectivityNativeDefault::unblockAllPortsForBind()
+0x9ba0: aidl::android::net::connectivity::aidl::IConnectivityNativeDefault::getPortsBlockedForBind(std::vector<int>*)
 ```
 
 ## 阶段 4：后处理分析（post_analyzer）
