@@ -58,6 +58,7 @@ python3 collect.py -o <output_dir> [-d <device_serial>] [-s | -3]
 | `-d, --device` | adb 设备 serial（非交互选择） |
 | `--ase-apk` | 探测用 AttackSurfaceExplorer APK 路径（默认优先使用预编译 `../AttackSurfaceExplorer/app-release.apk`） |
 | `--probe-only` | 仅安装 APK 并生成 `accessible_services.txt`，不 dump 固件 |
+| `--apex-only` | 仅 dump APEX 包并生成 `apex_index.csv` |
 | `-s, --system` | 仅 dump 系统包 |
 | `-3, --third-party` | 仅 dump 第三方应用（跳过 apex/binaries/selinux） |
 
