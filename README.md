@@ -146,7 +146,7 @@ JVM 默认 `-XX:MaxRAMPercentage=50.0`（分配当前设备内存的 50%），�
 
 ### Java AIDL 接口搜索
 
-加载 `packages/android/` 下的 framework jar/apk，识别 AIDL 接口（Default + Stub + Stub.Proxy 三件套），沿父类链 BFS 查找实现类并提取方法签名，支持间接继承。
+加载 `packages/android/` 下的 framework jar/apk 以及 `apex/*/javalib/` 下的 Mainline 模块核心 JAR 包（自动识别并跳过软链接/替身以防重复反编译），识别 AIDL 接口（Default + Stub + Stub.Proxy 三件套），沿父类链 BFS 查找实现类并提取方法签名，支持间接继承。
 
 | 输出 | 说明 |
 |------|------|
@@ -174,10 +174,10 @@ python3 native_analyzer.py <workspace_dir> [--ignore-registered]
 
 无需构建、无外部依赖。扫描各分区 `lib(64)`、`bin`（含 `bin/hw`）以及 `apex/` 容器下的全部 ELF 二进制：
 
-1. **Descriptor 提取** — 匹配 AIDL 字符串模式与 Rust v0 mangling 符号；
+1. **Descriptor 提取** — 匹配标准 AIDL 字符串模式、C++ libbinder 的 UTF-16LE String16 常量（如 `SurfaceFlinger`、`IAudioFlingerService`、`SensorServer` 等）、非标准命名接口（如 `ConnectivityNative`）与 Rust v0 mangling 符号；
 2. **多层服务端判定（解决 Strip 与 -fno-rtti 漏报）** — 结合 C++ Itanium ABI（`{len}Bn{Name}`）、Rust mangling、以及 ELF 动态符号表（`AIBinder_Class_define`、`AServiceManager_addService`、`defaultServiceManager` 等关键系统调用）；
 3. **技术栈架构识别（Backend）** — 基于 `DT_NEEDED` 依赖库与导出符号，自动分类为 `libbinder`（旧式私有 C++）、`ndk`（基于 `libbinder_ndk` 的 Stable AIDL）或 `rust`；
-4. **APEX 深度扫描** — 自动覆盖 Android 10+ Mainline 模块（如 Keystore2、Bluetooth、WiFi 等）；
+4. **APEX 深度扫描与去重** — 自动覆盖 Android 10+ Mainline 模块，并在遍历时跳过软链接（Finder 替身），确保二进制去重且仅扫描真实实体；
 5. **service_list 交叉引用** — 默认仅保留已注册 descriptor，`--ignore-registered` 输出全部 server 接口。
 
 | 输出 | 说明 |
@@ -213,6 +213,19 @@ python3 post_analyzer.py <workspace_dir> [-o <output_file>]
 # unresolved_accessible_services.txt
 media.camera [android.hardware.ICameraService] [no_aidl_matched]
 vendor.custom.daemon [] [empty_descriptor]
+```
+
+控制台同时输出对账汇总（覆盖率与分布统计）：
+
+```text
+=== Accessibility Reconciliation Summary ===
+Total probed services:      400
+Accessible services (ASE):  220
+  ├─ Resolved:              217 (98.6%)
+  │   ├─ Java AIDL:         193 (87.7%, accessible_service_aidl.txt)
+  │   └─ Native AIDL:       53 (24.1%, accessible_native_aidl.txt)
+  └─ Unresolved:            3 (1.4%) -> unresolved_accessible_services.txt
+============================================
 ```
 
 这些服务通常为**手写 Raw BBinder 实现（无标准 AIDL 接口）**、**Descriptor 为空的匿名服务**、或**实现在未扫描系统 App / APEX 中**，是安全研究员进行针对性人工逆向和动态测试（如使用 `runner.py`）的高价值目标。
@@ -358,6 +371,8 @@ cd ../post_analyzer && python3 post_analyzer.py ~/firmware/pixel8
 ```
 <workspace>/
 ├── packages/                       # 采集的 APK
+├── apex/                           # 采集的 APEX 模块（含 lib/bin/javalib 等）
+├── apex_index.csv                  # 采集：APEX 包名与挂载路径索引
 ├── system/lib64/、vendor/lib64/…   # 采集的二进制
 ├── service_list.txt                # 采集：已注册服务
 ├── accessible_services.txt         # 采集：实机可达服务
