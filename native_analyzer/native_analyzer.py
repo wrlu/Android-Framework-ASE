@@ -62,21 +62,42 @@ def find_elf_files(workspace):
     seen = set()
     for rel_dir, glob_pat in SCAN_DIRS:
         path = Path(workspace) / rel_dir
-        if not path.is_dir():
+        if not path.is_dir() or path.is_symlink():
             continue
-        for f in path.glob(glob_pat):
-            if not f.is_file():
-                continue
-            resolved = f.resolve()
-            if resolved in seen:
-                continue
-            try:
-                with open(f, 'rb') as fh:
-                    if fh.read(4) == ELF_MAGIC:
-                        elf_files.append(resolved)
-                        seen.add(resolved)
-            except (IOError, OSError):
-                pass
+        if rel_dir == 'apex':
+            # In apex/, there may be symlinks (Finder aliases / 替身) pointing to other apex directories.
+            # Traverse only real (non-symlink) subdirectories to avoid duplicate scanning.
+            for apex_entry in sorted(path.iterdir()):
+                if apex_entry.is_symlink() or not apex_entry.is_dir():
+                    continue
+                sub_pat = glob_pat.removeprefix('**/')
+                for f in apex_entry.glob('**/' + sub_pat):
+                    if f.is_symlink() or not f.is_file():
+                        continue
+                    resolved = f.resolve()
+                    if resolved in seen:
+                        continue
+                    try:
+                        with open(f, 'rb') as fh:
+                            if fh.read(4) == ELF_MAGIC:
+                                elf_files.append(resolved)
+                                seen.add(resolved)
+                    except (IOError, OSError):
+                        pass
+        else:
+            for f in path.glob(glob_pat):
+                if f.is_symlink() or not f.is_file():
+                    continue
+                resolved = f.resolve()
+                if resolved in seen:
+                    continue
+                try:
+                    with open(f, 'rb') as fh:
+                        if fh.read(4) == ELF_MAGIC:
+                            elf_files.append(resolved)
+                            seen.add(resolved)
+                except (IOError, OSError):
+                    pass
     return elf_files
 
 
@@ -344,7 +365,13 @@ def scan_so(so_path, registered_descriptors=None):
         except UnicodeDecodeError:
             pass
 
-    # Step 2b: Find AIDL descriptors from Rust v0 mangled symbols
+    # Step 2b: Check registered descriptors against binary data (supports UTF-8 and UTF-16LE String16)
+    if registered_descriptors:
+        for reg_desc in registered_descriptors:
+            if (reg_desc.encode('ascii') in data) or (reg_desc.encode('utf-16le') in data):
+                descriptors.add(reg_desc)
+
+    # Step 2c: Find AIDL descriptors from Rust v0 mangled symbols
     rust_servers = extract_rust_descriptors(data)
     descriptors.update(rust_servers)
 
@@ -355,9 +382,10 @@ def scan_so(so_path, registered_descriptors=None):
     result = {}
     for desc in descriptors:
         iface_full = desc.rsplit('.', 1)[-1]
-        if not iface_full.startswith('I') or len(iface_full) < 2:
-            continue
-        short_name = iface_full[1:]
+        if iface_full.startswith('I') and len(iface_full) > 1 and iface_full[1].isupper():
+            short_name = iface_full[1:]
+        else:
+            short_name = iface_full
 
         bn_str = 'Bn' + short_name
         bp_str = 'Bp' + short_name
@@ -383,6 +411,11 @@ def scan_so(so_path, registered_descriptors=None):
         # Legacy libbinder server heuristics (handles stripped binaries):
         if not is_server and elf_meta['is_legacy'] and elf_meta['has_legacy_server']:
             if registered_descriptors and desc in registered_descriptors:
+                is_server = True
+
+        # Fallback for registered services in binaries with binder dependencies
+        if not is_server and registered_descriptors and desc in registered_descriptors:
+            if elf_meta['is_ndk'] or elf_meta['is_legacy']:
                 is_server = True
 
         # Client heuristics
