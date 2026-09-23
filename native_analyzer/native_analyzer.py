@@ -253,16 +253,17 @@ def parse_service_list(workspace):
     e.g., 2  SurfaceFlingerAIDL: [android.gui.ISurfaceComposer]
 
     Returns:
-        (descriptors, name_to_desc): a set of registered descriptors and a
-        mapping from service name to descriptor.
+        (descriptors, name_to_desc, desc_to_names): a set of registered descriptors,
+        mapping from service name to descriptor, and mapping from descriptor to list of names.
     """
     service_file = Path(workspace) / 'service_list.txt'
     if not service_file.exists():
         logger.warning('service_list.txt not found')
-        return set(), {}
+        return set(), {}, defaultdict(list)
 
     descriptors = set()
     name_to_desc = {}
+    desc_to_names = defaultdict(list)
     with open(service_file) as f:
         for line in f:
             line = line.strip()
@@ -276,9 +277,10 @@ def parse_service_list(workspace):
                 if desc:
                     descriptors.add(desc)
                     name_to_desc[name] = desc
+                    desc_to_names[desc].append(name)
                 elif name:
                     name_to_desc.setdefault(name, '')
-    return descriptors, name_to_desc
+    return descriptors, name_to_desc, desc_to_names
 
 
 def load_accessible_services(workspace, name_to_desc):
@@ -342,11 +344,12 @@ def analyze(workspace, ignore_registered):
 
     # Registered filter: load service_list.txt unless ignored.
     # Accessibility results (accessible_services.txt) drive a separate output.
-    registered = set()
+    registered, name_to_desc, desc_to_names = parse_service_list(workspace)
     accessible = None
     if not ignore_registered:
-        registered, name_to_desc = parse_service_list(workspace)
         logger.info('Registered services: %d', len(registered))
+        accessible = load_accessible_services(workspace, name_to_desc)
+    elif name_to_desc:
         accessible = load_accessible_services(workspace, name_to_desc)
 
     # Only server entries
@@ -357,7 +360,7 @@ def analyze(workspace, ignore_registered):
         server_ifaces = {desc: info for desc, info in server_ifaces.items() if desc in registered}
 
     output_file = workspace / 'native_aidl.txt'
-    write_native_aidl(output_file, server_ifaces, accessible)
+    write_native_aidl(output_file, server_ifaces, accessible, desc_to_names=desc_to_names)
     logger.info('Output: %s', output_file)
     logger.info('Total: %d server implementations', len(server_ifaces))
 
@@ -366,7 +369,7 @@ def analyze(workspace, ignore_registered):
         accessible_ifaces = {d: info for d, info in server_ifaces.items()
                              if accessible.get(d) is True}
         accessible_file = workspace / 'accessible_native_aidl.txt'
-        write_native_aidl(accessible_file, accessible_ifaces)
+        write_native_aidl(accessible_file, accessible_ifaces, desc_to_names=desc_to_names)
         not_accessible = sum(1 for d in server_ifaces if accessible.get(d) is False)
         unknown = sum(1 for d in server_ifaces if d not in accessible)
         logger.info('Accessible output: %s', accessible_file)
@@ -374,11 +377,14 @@ def analyze(workspace, ignore_registered):
                     len(accessible_ifaces), not_accessible, unknown)
 
 
-def write_native_aidl(output_file, server_ifaces, accessible=None):
+def write_native_aidl(output_file, server_ifaces, accessible=None, desc_to_names=None):
     with open(output_file, 'w') as f:
         for desc in sorted(server_ifaces.keys()):
             so_list = ', '.join(sorted(server_ifaces[desc]['servers']))
             line = '{} [{}]'.format(desc, so_list)
+            if desc_to_names and desc in desc_to_names:
+                svc_names = ', '.join(sorted(set(desc_to_names[desc])))
+                line += ' [service={}]'.format(svc_names)
             if accessible is not None:
                 if desc in accessible:
                     line += ' [accessible={}]'.format(1 if accessible[desc] else 0)

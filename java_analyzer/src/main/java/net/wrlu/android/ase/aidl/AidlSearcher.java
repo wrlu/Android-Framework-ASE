@@ -11,6 +11,7 @@ import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -44,12 +45,13 @@ public class AidlSearcher {
 
             // Registered filter: load service_list.txt unless ignored.
             // Accessibility results (accessible_services.txt) drive a separate output.
-            Set<String> registered = new HashSet<>();
+            ServiceList serviceList = loadServiceList(ws);
+            Set<String> registered = serviceList.descriptors;
             Map<String, Boolean> accessible = null;
             if (!ignoreRegistered) {
-                ServiceList serviceList = loadServiceList(ws);
-                registered = serviceList.descriptors;
                 logger.info("Registered services: {}", registered.size());
+                accessible = loadAccessibleServices(ws, serviceList.nameToDesc);
+            } else if (!serviceList.nameToDesc.isEmpty()) {
                 accessible = loadAccessibleServices(ws, serviceList.nameToDesc);
             }
 
@@ -64,7 +66,8 @@ public class AidlSearcher {
             // Main output: keeps [accessible=...] markers
             try (FileWriter fw = new FileWriter(outputFile)) {
                 for (String aidlClass : outputClasses) {
-                    writeAidl(fw, instance, aidlClass, accessibleTag(accessible, aidlClass));
+                    String sTag = serviceTag(serviceList.descToNames, aidlClass);
+                    writeAidl(fw, instance, aidlClass, sTag, accessibleTag(accessible, aidlClass));
                 }
             }
             logger.info("Total: {} AIDL interfaces", outputClasses.size());
@@ -87,7 +90,8 @@ public class AidlSearcher {
                             continue;
                         }
                         accessibleCount++;
-                        writeAidl(fw, instance, aidlClass, "");
+                        String sTag = serviceTag(serviceList.descToNames, aidlClass);
+                        writeAidl(fw, instance, aidlClass, sTag, "");
                     }
                 }
                 logger.info("Accessible output: {}", accessibleFile.getAbsolutePath());
@@ -98,6 +102,19 @@ public class AidlSearcher {
             instance.close();
         }
         logger.info("AIDL search done: {}", outputFile.getAbsolutePath());
+    }
+
+    private static String serviceTag(Map<String, List<String>> descToNames, String aidlClass) {
+        if (descToNames == null) {
+            return "";
+        }
+        List<String> names = descToNames.get(aidlClass);
+        if (names == null || names.isEmpty()) {
+            return "";
+        }
+        List<String> sortedNames = new ArrayList<>(new HashSet<>(names));
+        Collections.sort(sortedNames);
+        return " [service=" + String.join(", ", sortedNames) + "]";
     }
 
     private static String accessibleTag(Map<String, Boolean> accessible, String aidlClass) {
@@ -111,10 +128,11 @@ public class AidlSearcher {
         return " [accessible=" + (value ? 1 : 0) + "]";
     }
 
-    private void writeAidl(FileWriter fw, JadxInstance instance, String aidlClass, String accessibleTag)
+    private void writeAidl(FileWriter fw, JadxInstance instance, String aidlClass,
+                           String serviceTag, String accessibleTag)
             throws IOException {
         String aidlImplClass = instance.getAidlImplClass(aidlClass);
-        fw.write(aidlClass + " [" + aidlImplClass + "]" + accessibleTag + "\n");
+        fw.write(aidlClass + " [" + aidlImplClass + "]" + serviceTag + accessibleTag + "\n");
         List<String> aidlMethods = instance.getAidlMethods(aidlClass);
         logger.info("AIDL classes {} methods count: {}",
                 aidlClass, aidlMethods != null ? aidlMethods.size() : 0);
@@ -129,6 +147,7 @@ public class AidlSearcher {
     private static final class ServiceList {
         final Set<String> descriptors = new HashSet<>();
         final Map<String, String> nameToDesc = new HashMap<>();
+        final Map<String, List<String>> descToNames = new HashMap<>();
     }
 
     private static ServiceList loadServiceList(Workspace ws) throws IOException {
@@ -154,6 +173,7 @@ public class AidlSearcher {
                     if (!desc.isEmpty()) {
                         serviceList.descriptors.add(desc);
                         serviceList.nameToDesc.put(name, desc);
+                        serviceList.descToNames.computeIfAbsent(desc, k -> new ArrayList<>()).add(name);
                     } else if (!name.isEmpty()) {
                         serviceList.nameToDesc.putIfAbsent(name, "");
                     }
