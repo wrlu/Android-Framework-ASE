@@ -524,31 +524,32 @@ def demangle_symbols(symbols):
 
 
 def extract_cpp_methods(desc, short_name, relevant_sos, so_symbols):
-    """Extract C++ method signatures from ELF dynamic symbols for pure native services (Scheme 1).
+    """Extract C++ method signatures with addresses from ELF dynamic symbols (Scheme 1).
 
     Returns:
-        list of str: formatted method lines (e.g. ['desc.method(args)', ...])
+        list of str: formatted method lines, e.g. '0x8e00: class::method(args)'
     """
     bp_str = 'Bp' + short_name
     default_str = 'I' + short_name + 'Default'
 
-    candidates = set()
+    candidates = {}
     for rel_so in relevant_sos:
         symbols = so_symbols.get(rel_so, {})
-        for sym in symbols.keys():
+        for sym, addr in symbols.items():
             if bp_str in sym or default_str in sym:
-                candidates.add(sym)
+                candidates.setdefault(sym, addr)
 
     if not candidates:
         return []
 
-    demangled_map = demangle_symbols(list(candidates))
+    demangled_map = demangle_symbols(list(candidates.keys()))
 
     method_pattern = re.compile(rf'(?:Bp{short_name}|I{short_name}Default)::(\w+)\((.*)\)')
-    methods = []
+    collected = []
     seen = set()
 
-    for mangled, demangled in demangled_map.items():
+    for mangled, addr in candidates.items():
+        demangled = demangled_map.get(mangled, mangled)
         if any(tok in demangled for tok in ('~', 'vtable', 'typeinfo', 'thunk', 'VTT', 'construction vtable')):
             continue
         m = method_pattern.search(demangled)
@@ -563,16 +564,17 @@ def extract_cpp_methods(desc, short_name, relevant_sos, so_symbols):
             continue
 
         # Clean C++ standard library types for readability
-        args_clean = args.replace('std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>', 'std::string')
-        args_clean = args_clean.replace('std::__1::', 'std::')
-        args_clean = re.sub(r'std::vector<([^,]+),\s*std::allocator<[^>]+>\s*>', r'std::vector<\1>', args_clean)
+        demangled_clean = demangled.replace('std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>', 'std::string')
+        demangled_clean = demangled_clean.replace('std::__1::', 'std::')
+        demangled_clean = re.sub(r'std::vector<([^,]+),\s*std::allocator<[^>]+>\s*>', r'std::vector<\1>', demangled_clean)
 
-        sig = f'{desc}.{name}({args_clean})'
-        if sig not in seen:
-            seen.add(sig)
-            methods.append(sig)
+        sig_key = f'{name}({args})'
+        if sig_key not in seen:
+            seen.add(sig_key)
+            collected.append((addr, demangled_clean))
 
-    return sorted(methods)
+    collected.sort(key=lambda x: x[0])
+    return [f'0x{addr:x}: {sig}' for addr, sig in collected]
 
 
 def locate_on_transact(desc, short_name, server_sos, so_symbols):
@@ -770,13 +772,12 @@ def analyze(workspace, ignore_registered):
         if on_transact_addr:
             desc_on_transact[desc] = on_transact_addr
 
-        if desc in java_methods and java_methods[desc]:
+        relevant_sos = info['servers'] | info['clients']
+        cpp_methods = extract_cpp_methods(desc, short_name, relevant_sos, so_symbols)
+        if cpp_methods:
+            desc_methods[desc] = cpp_methods
+        elif desc in java_methods and java_methods[desc]:
             desc_methods[desc] = java_methods[desc]
-        else:
-            relevant_sos = info['servers'] | info['clients']
-            cpp_methods = extract_cpp_methods(desc, short_name, relevant_sos, so_symbols)
-            if cpp_methods:
-                desc_methods[desc] = cpp_methods
 
     output_file = workspace / 'native_aidl.txt'
     write_native_aidl(output_file, server_ifaces, accessible, desc_to_names=desc_to_names,
