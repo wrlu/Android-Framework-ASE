@@ -144,6 +144,17 @@ def reconcile(workspace, output_file=None):
     all_resolved = java_resolved | native_resolved
     unresolved_services = sorted(accessible_services - all_resolved)
 
+    total_acc = len(accessible_services)
+    total_resolved = len(all_resolved & accessible_services)
+    total_unresolved = len(unresolved_services)
+    java_count = len(java_resolved & accessible_services)
+    native_count = len(native_resolved & accessible_services)
+
+    resolved_pct = (total_resolved / total_acc * 100.0) if total_acc else 0.0
+    unresolved_pct = (total_unresolved / total_acc * 100.0) if total_acc else 0.0
+    java_pct = (java_count / total_acc * 100.0) if total_acc else 0.0
+    native_pct = (native_count / total_acc * 100.0) if total_acc else 0.0
+
     target_output = Path(output_file).resolve() if output_file else (ws_path / 'unresolved_accessible_services.txt')
 
     with open(target_output, 'w', encoding='utf-8') as f:
@@ -152,10 +163,11 @@ def reconcile(workspace, output_file=None):
         f.write('# but without matching implementations in accessible_service_aidl.txt or accessible_native_aidl.txt.\n')
         f.write('#\n')
         f.write(f'# Total probed services:      {len(all_probed)}\n')
-        f.write(f'# Probed accessible services: {len(accessible_services)}\n')
-        f.write(f'# Java AIDL resolved:         {len(java_resolved & accessible_services)}\n')
-        f.write(f'# Native AIDL resolved:       {len(native_resolved & accessible_services)}\n')
-        f.write(f'# Unresolved accessible:      {len(unresolved_services)}\n')
+        f.write(f'# Probed accessible services: {total_acc}\n')
+        f.write(f'# Total resolved services:    {total_resolved} ({resolved_pct:.1f}%)\n')
+        f.write(f'#   ├─ Java AIDL resolved:    {java_count} ({java_pct:.1f}%)\n')
+        f.write(f'#   └─ Native AIDL resolved:  {native_count} ({native_pct:.1f}%)\n')
+        f.write(f'# Unresolved accessible:      {total_unresolved} ({unresolved_pct:.1f}%)\n')
         f.write('#\n')
         f.write('# Format: <service_name> [<descriptor>] [<reason>]\n')
         f.write('#\n')
@@ -170,15 +182,16 @@ def reconcile(workspace, output_file=None):
 
     logger.info('=== Accessibility Reconciliation Summary ===')
     logger.info('Total probed services:      %d', len(all_probed))
-    logger.info('Accessible services (ASE):  %d', len(accessible_services))
-    logger.info('  ├─ Java AIDL Resolved:    %d (%s)',
-                len(java_resolved & accessible_services),
+    logger.info('Accessible services (ASE):  %d', total_acc)
+    logger.info('  ├─ Resolved:              %d (%.1f%%)', total_resolved, resolved_pct)
+    logger.info('  │   ├─ Java AIDL:         %d (%.1f%%, %s)',
+                java_count, java_pct,
                 java_aidl_file.name if java_aidl_file.exists() else 'not found')
-    logger.info('  ├─ Native AIDL Resolved:  %d (%s)',
-                len(native_resolved & accessible_services),
+    logger.info('  │   └─ Native AIDL:       %d (%.1f%%, %s)',
+                native_count, native_pct,
                 native_aidl_file.name if native_aidl_file.exists() else 'not found')
-    logger.info('  └─ Unresolved:            %d -> %s',
-                len(unresolved_services), target_output.name)
+    logger.info('  └─ Unresolved:            %d (%.1f%%) -> %s',
+                total_unresolved, unresolved_pct, target_output.name)
     logger.info('=' * 44)
 
 
