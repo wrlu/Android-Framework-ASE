@@ -1,10 +1,12 @@
 import os
 import sys
+import re
 import json
 import copy
 import argparse
 import logging
 import subprocess
+import xml.etree.ElementTree as ET
 from collections import namedtuple
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
@@ -61,6 +63,9 @@ class AdbDevice:
             args.append(dest_name)
         r = self._run(*args, cwd=cwd)
         if r.returncode != 0:
+            if sys.stderr.isatty():
+                sys.stderr.write('\n')
+                sys.stderr.flush()
             logger.warning('adb pull failed: %s (rc=%d)', remote, r.returncode)
         return r.returncode == 0
 
@@ -211,9 +216,151 @@ def dump_apk_folder(device, package, workspace):
         device.pull(apk_folder + '/' + filename, filename, cwd=dest_dir)
 
 
-def dump_apex_folder(device, apex, workspace):
-    mounted_apex_path = '/apex/' + apex['apex_name']
-    device.pull(mounted_apex_path, apex['apex_name'], cwd=os.path.join(workspace, 'apex'))
+def get_apex_mount_info(device):
+    """Parse active APEX mounts and apex-info-list.xml from device."""
+    mounted_paths = set()
+    try:
+        proc_mounts = device.shell('cat', '/proc/mounts').decode('utf-8', 'ignore')
+        for line in proc_mounts.strip().split('\n'):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].startswith('/apex/'):
+                p = parts[1]
+                if p != '/apex/apex-info-list.xml':
+                    mounted_paths.add(p)
+    except Exception:
+        pass
+
+    path_map = {}
+    module_map = {}
+    try:
+        xml_out = device.shell('cat', '/apex/apex-info-list.xml').decode('utf-8', 'ignore')
+        if xml_out.strip().startswith('<?xml') or '<apex-info-list>' in xml_out:
+            root = ET.fromstring(xml_out)
+            for info in root.findall('apex-info'):
+                if info.get('isActive') == 'true':
+                    mname = info.get('moduleName')
+                    vcode = info.get('versionCode')
+                    mpath = info.get('modulePath')
+                    prepath = info.get('preinstalledModulePath')
+
+                    actual_mount = None
+                    cands = [f'/apex/{mname}', f'/apex/{mname}@{vcode}']
+                    for c in cands:
+                        if c in mounted_paths:
+                            actual_mount = c
+                            break
+                    if not actual_mount:
+                        for mp in mounted_paths:
+                            if mp == f'/apex/{mname}' or mp.startswith(f'/apex/{mname}@'):
+                                actual_mount = mp
+                                break
+                    if not actual_mount:
+                        actual_mount = f'/apex/{mname}'
+
+                    module_map[mname] = actual_mount
+                    if mpath:
+                        path_map[mpath] = actual_mount
+                    if prepath:
+                        path_map[prepath] = actual_mount
+    except Exception:
+        pass
+
+    mount_by_name = {}
+    for mp in mounted_paths:
+        name = mp[len('/apex/'):]
+        mount_by_name[name] = mp
+        if '@' in name:
+            base_name = name.split('@')[0]
+            if base_name not in mount_by_name:
+                mount_by_name[base_name] = mp
+
+    return {
+        'path_map': path_map,
+        'module_map': module_map,
+        'mount_by_name': mount_by_name,
+        'mounted_paths': mounted_paths,
+    }
+
+
+def resolve_mounted_apex_path(apex, mount_info):
+    """Resolve the actual mounted directory under /apex for a given APEX entry."""
+    name = apex.get('apex_name', '')
+    path = apex.get('path', '')
+
+    path_map = mount_info.get('path_map', {})
+    module_map = mount_info.get('module_map', {})
+    mount_by_name = mount_info.get('mount_by_name', {})
+
+    # 1. Exact match from xml modulePath or preinstalledModulePath
+    if path and path in path_map:
+        return path_map[path]
+
+    # 2. Match from xml moduleName
+    if name and name in module_map:
+        return module_map[name]
+
+    # 3. Direct match in mount_by_name
+    if name and name in mount_by_name:
+        return mount_by_name[name]
+
+    # 4. Extract base name from apex file path
+    base = ''
+    if path:
+        base = os.path.basename(path).split('@')[0]
+        for ext in ('.decompressed.apex', '.decompressed.capex', '.apex', '.capex'):
+            if base.endswith(ext):
+                base = base[:-len(ext)]
+                break
+        if base in module_map:
+            return module_map[base]
+        if base in mount_by_name:
+            return mount_by_name[base]
+
+    # 5. Transform name variants (e.g. com.google.android.* -> com.android.*)
+    candidates = [name]
+    if base:
+        candidates.append(base)
+    if name.startswith('com.google.android.'):
+        candidates.append('com.android.' + name[len('com.google.android.'):])
+    if name.startswith('com.google.'):
+        candidates.append(name[len('com.google.'):])
+        candidates.append('com.' + name[len('com.google.'):])
+
+    for c in list(candidates):
+        c_stripped = re.sub(r'[\d\-_]+$', '', c)
+        if c_stripped and c_stripped != c:
+            candidates.append(c_stripped)
+
+    for c in candidates:
+        if c in module_map:
+            return module_map[c]
+        if c in mount_by_name:
+            return mount_by_name[c]
+
+    # 6. Prefix match against mounted directories
+    for c in candidates:
+        for mname, mp in mount_by_name.items():
+            if mname.startswith(c) or c.startswith(mname):
+                return mp
+
+    return '/apex/' + name
+
+
+def dump_apex_folder(device, apex, workspace, mount_info=None):
+    if mount_info is None:
+        mount_info = get_apex_mount_info(device)
+    mounted_apex_path = resolve_mounted_apex_path(apex, mount_info)
+    apex_dir = os.path.join(workspace, 'apex')
+    ok = device.pull(mounted_apex_path, apex['apex_name'], cwd=apex_dir)
+    mounted_name = os.path.basename(mounted_apex_path).split('@')[0]
+    if ok and mounted_name and mounted_name != apex['apex_name']:
+        link_path = os.path.join(apex_dir, mounted_name)
+        if not os.path.exists(link_path):
+            try:
+                os.symlink(apex['apex_name'], link_path)
+            except OSError:
+                pass
+    return ok
 
 
 def dump_binary_folder(device, binary_path, partition, workspace, sub_dir):
@@ -310,8 +457,13 @@ def dump_packages(device, workspace, pkg_filter_mode):
 
 
 def dump_apexes(device, workspace):
-    output = device.shell('pm', 'list', 'packages', '--user', '0', '-f', '--apex-only').decode('ascii')
+    mount_info = get_apex_mount_info(device)
+    output = device.shell('pm', 'list', 'packages', '--user', '0', '-f', '--apex-only').decode('ascii', 'ignore')
     apexes = parse_pm_list(output, with_uid=False)
+    if not apexes and mount_info.get('mounted_paths'):
+        for mp in sorted(mount_info['mounted_paths']):
+            mname = os.path.basename(mp).split('@')[0]
+            apexes.append({'apex_name': mname, 'path': mp})
     apex_dir = os.path.join(workspace, 'apex')
     os.makedirs(apex_dir, exist_ok=True)
     with open(os.path.join(workspace, 'apex_index.csv'), 'w') as f:
@@ -320,7 +472,7 @@ def dump_apexes(device, workspace):
         for i, apex in enumerate(apexes):
             f.write(apex['apex_name'] + ',' + apex['path'] + '\n')
             f.flush()
-            dump_apex_folder(device, apex, workspace)
+            dump_apex_folder(device, apex, workspace, mount_info=mount_info)
             show_progress(i + 1, total, 'Dump apex binaries for ' + apex['apex_name'])
 
 
