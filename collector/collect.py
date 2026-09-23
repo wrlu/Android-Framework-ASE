@@ -636,6 +636,8 @@ def main():
                                          '(default: precompiled AttackSurfaceExplorer/app-release.apk).')
     parser.add_argument('--probe-only', action='store_true',
                         help='Only run the binder service accessibility probe and generate accessible_services.txt.')
+    parser.add_argument('--apex-only', action='store_true',
+                        help='Only dump APEX packages and generate apex_index.csv.')
     exclusive_group = parser.add_mutually_exclusive_group()
     exclusive_group.add_argument('-s', '--system', action='store_true', help='Only dump system packages.')
     exclusive_group.add_argument('-3', '--third-party', action='store_true', help='Only dump third party packages.')
@@ -661,6 +663,12 @@ def main():
     if args.probe_only:
         logger.info('[Probe] Run binder service probe only')
         dump_accessible_services(device, workspace, ase_apk)
+        logger.info('Done')
+        return
+
+    if args.apex_only:
+        logger.info('[APEX] Dump APEX packages only')
+        dump_apexes(device, workspace)
         logger.info('Done')
         return
 
