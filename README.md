@@ -12,6 +12,7 @@ Android 固件攻击面分析工具，覆盖「固件采集 → 静态分析 →
 
 ```
 .
+├── run.sh                         # 一键全流程启动脚本（提取 + 全套分析）
 ├── collector/
 │   └── collect.py                 # 固件采集
 ├── java_analyzer/
@@ -44,6 +45,28 @@ Android 固件攻击面分析工具，覆盖「固件采集 → 静态分析 →
 | adb | 1.0.41+ | collector |
 | JDK | 21+ | java_analyzer |
 | Gradle | 8.5+ | java_analyzer（仓库自带 wrapper） |
+
+## 一键全流程（One-Click Pipeline）
+
+在项目根目录下通过 `run.sh` 脚本可完成从设备固件提取到组件、Java 服务、Native 服务及盲区对齐的完整端到端分析：
+
+```bash
+# 1. 全流程：从连接的 adb 设备采集固件并执行完整分析
+./run.sh <workspace_dir>
+
+# 2. 纯分析：对已有固件 dump 目录运行完整分析（跳过设备采集）
+./run.sh <workspace_dir> --analyze-only
+
+# 3. 仅重新探测实机可达性并分析
+./run.sh <workspace_dir> --probe-only
+
+# 4. 指定 adb 设备或仅采集系统包
+./run.sh <workspace_dir> -d <device_serial> -s
+```
+
+`run.sh` 会自动检测设备连接状态、按需构建 Java Analyzer JAR 包，并依序执行全部分析阶段。
+
+各阶段亦可独立单步执行：
 
 ## 阶段 1：固件采集（collector）
 
