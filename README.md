@@ -6,7 +6,7 @@ Android 固件攻击面分析工具，覆盖「固件采集 → 静态分析 →
 - **java_analyzer** — 基于 JADX 分析 Java 层导出组件权限与 AIDL 接口
 - **native_analyzer** — 扫描 .so 中的 Native AIDL 接口
 - **post_analyzer** — 比对实机可访问服务与静态分析结果，提取未匹配 AIDL 的盲区服务差集
-- **AttackSurfaceExplorer** — 设备端 APK，实机探测 binder 服务能否被获取
+- **AttackSurfaceExplorer** — 设备端 Binder 探测与动态 PoC 验证框架（详见 [AttackSurfaceExplorer/README.md](AttackSurfaceExplorer/README.md)）
 
 ## 目录结构
 
@@ -27,7 +27,7 @@ Android 固件攻击面分析工具，覆盖「固件采集 → 静态分析 →
 │   └── native_analyzer.py         # Native AIDL 扫描
 ├── post_analyzer/
 │   └── post_analyzer.py           # 后处理：求差集与盲区服务分析
-└── AttackSurfaceExplorer/         # 设备端 Binder 探测与动态执行 APK
+└── AttackSurfaceExplorer/         # 设备端 Binder 探测与动态验证框架（详见子目录 README）
     ├── runner.py                  # 主机端动态脚本编译与执行工具
     ├── sample_scripts/            # 验证脚本示例
     └── app/src/main/java/net/wrlu/ase/
@@ -68,7 +68,7 @@ Android 固件攻击面分析工具，覆盖「固件采集 → 静态分析 →
 
 各阶段亦可独立单步执行：
 
-## 阶段 1：固件采集（collector）
+## 阶段 1：固件采集与实机探测（collector & ASE BinderProber）
 
 ```bash
 cd collector
@@ -85,26 +85,48 @@ python3 collect.py -o <output_dir> [-d <device_serial>] [-s | -3]
 | `-s, --system` | 仅 dump 系统包 |
 | `-3, --third-party` | 仅 dump 第三方应用（跳过 apex/binaries/selinux） |
 
-采集内容：
+### 采集内容
 
 | 内容 | 输出 |
 |------|------|
 | 包（APK） | `packages/<pkg>/` |
 | APEX / Overlay | `apex/`、`overlay/` |
-| 二进制 | 各分区的 `bin` / `lib(64)` / `etc` |
+| 二进制 | 各分区的 `bin` / `lib(64)` / `etc`（支持非 root 自动容错拉取） |
 | init 脚本 | `init/`（链接到各分区 `etc/init`） |
 | SELinux / 权限策略 | `selinux/`、`permissions/` |
 | 运行元数据 | `getprop.txt`、`lshal.txt`、`service_list.txt`、`accessible_services.txt`、`netstat.txt`、`settings_*.txt` |
 
-`accessible_services.txt` 由 ASE APK 实机探测生成（服务名 → 是否可取到 `IBinder`）：
+### 实机 Binder 服务可达性探针（BinderProber）
 
-```
-Row: 0 service=DockObserver, accessible=0
-Row: 1 service=SurfaceFlinger, accessible=1
-Row: 2 service=SurfaceFlingerAIDL, accessible=1
-```
+静态分析只能识别系统镜像中存在哪些 AIDL 接口与实现类，无法得知在真实设备运行环境中，厂商定制的 SELinux 策略、SELinux ioctl 规则、UID/GID 校验是否会在底层阻断三方普通应用获取特定系统服务。
 
-在已有 dump 上可用 `--probe-only` 只刷新该文件；APK 缺失或 provider 不可用时会跳过，不影响其余采集。
+因此，`collector` 在采集运行元数据阶段，会自动将预编译的 **AttackSurfaceExplorer** APK（`app-release.apk`）推送到设备并调用其内置的 **`BinderProber`**：
+
+1. **探测原理**：
+   - 以普通应用沙箱身份（`untrusted_app`，标准 App UID）通过私有 API 反射调用 `ServiceManager.getService(name)`；
+   - **仅探测句柄可达性与存活性**（`binder != null && binder.isBinderAlive()`）；
+   - **不读取 descriptor，也不主动发起 AIDL 事务方法调用**，彻底杜绝在探测阶段因非法传参诱发系统服务异常、死锁或系统崩溃（Crash）。
+2. **生成基准**：
+   - 探测结果通过通用的 `ContentProvider`（`content://net.wrlu.ase.probe/binder_service`）回传，并写入 **`accessible_services.txt`**；
+   - 该文件是后续阶段 2（`java_analyzer`）、阶段 3（`native_analyzer`）和阶段 4（`post_analyzer`）筛选可达服务与求盲区差集的核心基准。
+3. **手动调试与独立查询命令**：
+   ```bash
+   # 查询全部已注册服务的可达性
+   adb shell content query --uri content://net.wrlu.ase.probe/binder_service
+
+   # 查询指定单个服务（例如 activity 服务）
+   adb shell content query --uri content://net.wrlu.ase.probe/binder_service --where "activity"
+   ```
+   输出示例：
+   ```text
+   Row: 0 service=DockObserver, accessible=0
+   Row: 1 service=SurfaceFlinger, accessible=1
+   Row: 2 service=SurfaceFlingerAIDL, accessible=1
+   ```
+   - `accessible=1`：代表当前应用沙箱能成功取得该 Binder 句柄且存活；
+   - `accessible=0`：代表权限受阻（SELinux 或 UID 拦截）或服务未注册。
+
+在已有固件 dump 上，可用 `--probe-only` 仅刷新该可达性探针文件；若 APK 缺失或 provider 不可用，工具会自动跳过探针，此时后续分析退化为无实机验证的全量静态分析。
 
 ## 阶段 2：Java 层分析（java_analyzer）
 
@@ -258,131 +280,30 @@ Accessible services (ASE):  220
 
 这些服务通常为**手写 Raw BBinder 实现（无标准 AIDL 接口）**、**Descriptor 为空的匿名服务**、或**实现在未扫描系统 App / APEX 中**，是安全研究员进行针对性人工逆向和动态测试（如使用 `runner.py`）的高价值目标。
 
-## 阶段 5：设备端 Binder 探测（AttackSurfaceExplorer）
+## 动态验证与 PoC 测试（AttackSurfaceExplorer）
 
-静态分析只能判断接口存在，无法判断实机上能否真正拿到 binder 句柄。AttackSurfaceExplorer 以 **APK 自身 uid/权限** 通过 `android.os.ServiceManager` 获取服务，仅探测能否取到 `IBinder`——不读取 descriptor，也不调用 AIDL 方法。
+在完成静态分析与后处理盲区提取后，安全研究员通常需要对暴露出的**盲区服务（`unresolved_accessible_services.txt`）**或特定高危 AIDL 业务接口进行实机交互与漏洞利用验证。
 
-APK 使用内置的 `ase-release.jks` 做 release 签名（匿名化信息）。仓库根目录已包含预编译的 `AttackSurfaceExplorer/app-release.apk`，`collector/collect.py` 默认优先使用该预编译包并以覆盖安装（`adb install -r -g`）方式推送到设备。若需修改 ASE 源码并重新编译，也可手动操作：
-
-```bash
-cd AttackSurfaceExplorer
-./gradlew :app:assembleRelease
-adb install -r -g app/build/outputs/apk/release/app-release.apk
-```
-
-通过导出的通用 DataProvider 探测（当前端点 URI 为 `content://net.wrlu.ase.probe/binder_service`）：
+项目配套提供了 **AttackSurfaceExplorer** 设备端组件与主机端 **`runner.py`** 动态执行工具：
+- **双重能力**：既作为采集阶段实机 Binder 可达性探针（`BinderProber`，输出 `accessible_services.txt`），也提供免打包完整测试 App 的独立进程 Java/DEX 动态脚本执行能力；
+- **HiddenApi 全豁免与进程崩溃隔离**：脚本运行在专属的 `:runner` 前台服务子进程中，已注入 HiddenApiBypass，发生 Crash/OOM 完全不影响主系统；
+- **持有完整 Context**：可直接反射私有框架类、发起 Binder IPC 事务、动态注册广播接收器与发起 Provider 查询；
+- **详见独立文档**：有关探针查询命令、脚本编写契约接口、CLI 参数说明及使用限制，请参阅 **[AttackSurfaceExplorer/README.md](AttackSurfaceExplorer/README.md)**。
 
 ```bash
-# 全部服务
-adb shell content query --uri content://net.wrlu.ase.probe/binder_service
-
-# 单个服务（--where 传服务名）
-adb shell content query --uri content://net.wrlu.ase.probe/binder_service --where "activity"
-```
-
-输出示例：
-
-```
-Row: 0 service=DockObserver, accessible=0
-Row: 1 service=SurfaceFlinger, accessible=1
-Row: 2 service=SurfaceFlingerAIDL, accessible=1
-```
-
-| 调用 | 行为 |
-|------|------|
-| 不传 | 枚举全部服务并逐个测试 |
-| 传服务名 | 仅测试该服务 |
-
-| 返回列 | 含义 |
-|--------|------|
-| `service` | 服务名 |
-| `accessible` | `1` = 取到 `IBinder` 且存活；`0` = 取不到（未注册或无权获取） |
-
-Provider 通过 `Binder.getCallingUid()` 限制调用方：仅本应用、system(1000)、adb shell(2000) 与 root(0) 可用。
-
-### 动态脚本自主验证（runner.py）
-
-基于动态 DEX 加载与独立进程前台服务（`:runner`），支持在真机上直接执行单文件测试脚本。
-
-#### 1. 能力范围
-- **框架私有 API 调用**：`:runner` 进程已全局注入 HiddenApi 豁免，可直接反射与调用所有 `@hide` 框架类及 `ServiceManager`。
-- **持有 Service Context**：直接获取 Service 的 `Context` 上下文，可进行 Binder IPC 交互、动态注册广播接收器、发起 ContentProvider 查询等。
-- **进程级崩溃隔离**：运行在独立的 `:runner` 前台服务进程中，脚本发生 Crash、OOM 或死循环完全不影响 ASE 主进程。
-- **结构化结果回传**：自动捕获脚本返回值、`System.out` 输出及未捕获异常堆栈，以结构化 JSON 回传给主机端。
-
-#### 2. 使用限制
-- **不支持组件生命周期回调**：无法在运行时动态声明清单组件（Activity / Service / Provider 等），不支持依赖系统静态绑定的生命周期回调（如 AccessibilityService、DeviceAdminReceiver、NotificationListenerService 等）。
-- **无法动态增减权限**：受限于宿主 ASE 已有的权限，无法动态声明新的 `<uses-permission>`，也无法获取厂商专有签名特权。
-- **无打包资源表（Resources）**：DEX 不包含 `resources.arsc` 资源表，不支持 `R.layout.xxx` 等编译期资源，仅限纯代码逻辑。
-- **普通应用沙箱**：运行身份为标准 App UID（`u0_aXXX`）与 `untrusted_app` SELinux 域，不具备 root 特权。
-
-#### 3. 编写脚本
-实现 `AseScript` 契约接口：
-
-```java
-package net.wrlu.ase.payload;
-
-import android.content.Context;
-import android.os.IBinder;
-import net.wrlu.ase.binder.ServiceManager;
-import net.wrlu.ase.script.AseScript;
-
-public class TestServiceProbe implements AseScript {
-    @Override
-    public String run(Context context, String args) throws Throwable {
-        String name = (args != null && !args.isEmpty()) ? args : "activity";
-        System.out.println("[Script] Probing service: " + name);
-        IBinder binder = ServiceManager.getService(name);
-        if (binder == null) {
-            return "DENIED_OR_NOT_FOUND";
-        }
-        return "SUCCESS: alive=" + binder.isBinderAlive() + ", desc=" + binder.getInterfaceDescriptor();
-    }
-}
-```
-
-#### 4. 执行方式
-主机端使用 `AttackSurfaceExplorer/runner.py`，自动调用本地 Android SDK（`javac` + `d8`）编译、推送到设备并拉起服务：
-
-```bash
-# 传入 Java 源码直接执行（自动编译并运行）
+# 快速执行实机测试脚本验证特定服务（例如探测 activity 服务）
 python3 AttackSurfaceExplorer/runner.py AttackSurfaceExplorer/sample_scripts/TestServiceProbe.java -a "activity"
-
-# 传入预编译的 DEX 文件
-python3 AttackSurfaceExplorer/runner.py payload.dex -c net.wrlu.ase.payload.TestServiceProbe
-```
-
-| 参数 | 说明 |
-|------|------|
-| `script` | 待执行的 `.java` 源码或 `.dex` 文件路径 |
-| `-c, --entry-class` | 入口类全限定名（传入 `.java` 时自动从源码解析，可省略） |
-| `-a, --args` | 传递给 `run()` 方法的入参字符串（如 JSON、服务名，默认空） |
-| `-d, --device` | 指定 adb 设备 serial |
-| `-t, --timeout` | 超时时间（默认 `30` 秒） |
-| `-o, --output` | 保存结构化 JSON 结果到本地文件 |
-| `--no-clean` | 保留推送到设备上的临时 DEX 文件（默认自动清理） |
-
-#### 5. 结果输出格式
-控制台会打印执行摘要，返回包含状态、耗时、标准输出及异常堆栈的结构化 JSON：
-
-```json
-{
-  "status": "success",
-  "result": "SUCCESS: alive=true, desc=android.app.IActivityManager",
-  "stdout": "[Script] Probing service: activity\n",
-  "error": "",
-  "elapsed_ms": 15
-}
 ```
 
 ## 完整流程
 
 ```bash
-# 0. 构建探测 APK（可选，已内置预编译 AttackSurfaceExplorer/app-release.apk，仅修改源码时需要）
-cd AttackSurfaceExplorer && ./gradlew :app:assembleRelease
+# 方式一：根目录单脚本一键全流程（推荐，提取 + Java 分析 + Native 分析 + 后处理）
+./run.sh ~/firmware/pixel8
 
-# 1. 采集固件（同时生成 accessible_services.txt）
-cd ../collector && python3 collect.py -o ~/firmware/pixel8
+# 方式二：分步独立执行
+# 1. 采集固件（自动通过 ASE APK 生成 accessible_services.txt）
+cd collector && python3 collect.py -o ~/firmware/pixel8
 
 # 2. Java 层分析
 cd ../java_analyzer && ./gradlew shadowJar && ./analyzer.sh ~/firmware/pixel8
@@ -390,8 +311,11 @@ cd ../java_analyzer && ./gradlew shadowJar && ./analyzer.sh ~/firmware/pixel8
 # 3. Native AIDL 分析
 cd ../native_analyzer && python3 native_analyzer.py ~/firmware/pixel8
 
-# 4. 后处理（求差集，输出未匹配的实机可达服务）
+# 4. 后处理（求差集，输出未匹配 AIDL 的盲区服务）
 cd ../post_analyzer && python3 post_analyzer.py ~/firmware/pixel8
+
+# 可选：针对盲区服务或高危 AIDL 进行实机动态 PoC 验证
+cd ../AttackSurfaceExplorer && python3 runner.py sample_scripts/TestServiceProbe.java -a "service_name"
 ```
 
 ## 输出文件
