@@ -57,12 +57,16 @@ class AdbDevice:
             return self.shell_su(*cmd)
         return self.shell(*cmd)
 
-    def pull(self, remote, dest_name=None, cwd='.'):
+    def is_dir(self, remote_path):
+        res = self.shell('[', '-d', remote_path, ']', '&&', 'echo', '1')
+        return res.strip() == b'1'
+
+    def pull(self, remote, dest_name=None, cwd='.', warn=True):
         args = ['pull', remote]
         if dest_name:
             args.append(dest_name)
         r = self._run(*args, cwd=cwd)
-        if r.returncode != 0:
+        if r.returncode != 0 and warn:
             if sys.stderr.isatty():
                 sys.stderr.write('\n')
                 sys.stderr.flush()
@@ -363,18 +367,65 @@ def dump_apex_folder(device, apex, workspace, mount_info=None):
     return ok
 
 
-def dump_binary_folder(device, binary_path, partition, workspace, sub_dir):
-    if device.root_status == 'adb_root':
-        device.pull(binary_path, cwd=os.path.join(workspace, sub_dir))
-    else:
-        device.shell_with_root('cp', '-r', binary_path,
-                               os.path.join('/sdcard/.dump_android_script/', partition))
-        device.pull(os.path.join('/sdcard/.dump_android_script/', binary_path[1:]),
-                    cwd=os.path.join(workspace, sub_dir))
+def dump_readable_files(device, remote_path, local_dest):
+    """Fallback for directories where direct adb pull failed or was partial due to permissions.
+
+    Enumerates readable files (including subdirectories) and pulls them
+    preserving relative directory structure.
+    """
+    os.makedirs(local_dest, exist_ok=True)
+    cmd = (f'for f in {remote_path}/* {remote_path}/*/* {remote_path}/*/*/*; do '
+           'if [ -r "$f" ] && [ -f "$f" ]; then echo "$f"; fi; done')
+    out = device.shell(cmd).decode('ascii', errors='ignore').strip()
+    if not out:
+        return 0
+    files = [line.strip() for line in out.splitlines() if line.strip()]
+    pulled_count = 0
+    remote_prefix = remote_path.rstrip('/') + '/'
+    for f in files:
+        if not f.startswith(remote_prefix):
+            continue
+        rel_f = f[len(remote_prefix):]
+        dest_file = os.path.join(local_dest, rel_f)
+        if os.path.exists(dest_file):
+            continue
+        os.makedirs(os.path.dirname(dest_file), exist_ok=True)
+        if device.pull(f, dest_name=os.path.basename(dest_file), cwd=os.path.dirname(dest_file), warn=False):
+            pulled_count += 1
+    return pulled_count
+
+
+def dump_binary_folder(device, remote_path, partition, workspace, sub_dir):
+    remote_path = remote_path.rstrip('/')
+    if not device.is_dir(remote_path):
+        return
+
+    partition_dir = os.path.join(workspace, partition)
+    local_dest = os.path.join(partition_dir, sub_dir)
+    os.makedirs(partition_dir, exist_ok=True)
+
+    ok = False
+    if device.root_status == 'su_root':
+        # su_root: use su to copy to /data/local/tmp (ext4/f2fs supports symlinks, unlike /sdcard)
+        tmp_dir = f'/data/local/tmp/.dump_android_script/{partition}_{sub_dir}'
+        device.shell_su('rm', '-rf', tmp_dir)
+        device.shell_su('mkdir', '-p', tmp_dir)
+        device.shell_su('cp', '-a', f'{remote_path}/.', tmp_dir)
+        device.shell_su('chmod', '-R', '777', tmp_dir)
+        ok = device.pull(tmp_dir, dest_name=sub_dir, cwd=partition_dir, warn=False)
+        device.shell_su('rm', '-rf', tmp_dir)
+
+    if not ok:
+        ok = device.pull(remote_path, dest_name=sub_dir, cwd=partition_dir, warn=False)
+
+    # Universal tolerance for restricted directories across all folders:
+    # If direct pull failed or missed files due to permission/SELinux restrictions,
+    # enumerate and pull all remaining readable files.
+    dump_readable_files(device, remote_path, local_dest)
 
 
 def dump_binary_folder_directly(device, binary_path, workspace, sub_dir):
-    device.pull(binary_path, cwd=os.path.join(workspace, sub_dir))
+    device.pull(binary_path, cwd=os.path.join(workspace, sub_dir), warn=False)
 
 
 def dump_selinux_policy(device, workspace):
@@ -600,20 +651,17 @@ def link_if_exists(src, dst):
 
 
 def dump_binaries(device, workspace):
-    root_status = device.root_status
-    for part in ['system', 'vendor', 'system_ext', 'product', 'odm']:
+    partitions = ['system', 'vendor', 'system_ext', 'product', 'odm']
+    sub_dirs = ['bin', 'lib64', 'lib', 'etc']
+    total = len(partitions) * len(sub_dirs)
+    step = 0
+    for part in partitions:
         os.makedirs(os.path.join(workspace, part), exist_ok=True)
-    if root_status != 'adb_root':
-        device.shell('mkdir', '/sdcard/.dump_android_script/')
-        for p in ['system', 'vendor', 'system_ext', 'product', 'odm']:
-            device.shell('mkdir', '/sdcard/.dump_android_script/' + p)
-
-    for part in ['system', 'vendor', 'system_ext', 'product', 'odm']:
-        for sub in ['bin', 'lib64', 'lib', 'etc']:
-            dump_binary_folder(device, '/' + part + '/' + sub + '/', part, workspace, part)
-
-    if root_status != 'adb_root':
-        device.shell('rm', '-rf', '/sdcard/.dump_android_script')
+        for sub in sub_dirs:
+            step += 1
+            remote_path = '/' + part + '/' + sub
+            show_progress(step, total, 'Dump binaries for ' + remote_path)
+            dump_binary_folder(device, remote_path, part, workspace, sub)
 
 
 def dump_init_scripts(device, workspace):
@@ -626,6 +674,9 @@ def dump_init_scripts(device, workspace):
 
 def cleanup_tmp(device):
     device.shell('rm', '-rf', '/sdcard/.dump_android_script')
+    device.shell('rm', '-rf', '/data/local/tmp/.dump_android_script')
+    if device.root_status == 'su_root':
+        device.shell_su('rm', '-rf', '/data/local/tmp/.dump_android_script')
 
 
 def main():
