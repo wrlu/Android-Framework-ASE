@@ -95,6 +95,7 @@ public class AidlClass {
                     return child;
                 }
                 for (JavaClass child : children) {
+                    queue.add(child.getRawName());
                     queue.add(child.getClassNode().getClassInfo().getFullName());
                 }
             }

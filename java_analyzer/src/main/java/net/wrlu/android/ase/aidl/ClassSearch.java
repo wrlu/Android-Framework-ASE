@@ -15,6 +15,7 @@ public class ClassSearch implements IClassSearch {
         for (JavaClass cls : classes) {
             String rawName = cls.getClassNode().getClassInfo().getFullName();
             byRawName.putIfAbsent(rawName, cls);
+            byRawName.putIfAbsent(cls.getRawName(), cls);
 
             ArgType superType = cls.getClassNode().getSuperClass();
             if (superType != null) {

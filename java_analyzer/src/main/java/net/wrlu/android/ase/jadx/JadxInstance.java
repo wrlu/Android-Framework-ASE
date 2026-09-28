@@ -88,6 +88,7 @@ public class JadxInstance {
         }
 
         JadxArgs jadxArgs = new JadxArgs();
+        jadxArgs.setRenameValid(false);
         if (files.size() > 1) {
             jadxArgs.setInputFiles(files);
         } else {
@@ -196,7 +197,7 @@ public class JadxInstance {
 
         return Optional.ofNullable(aidlClass)
                 .flatMap(ac -> Optional.ofNullable(ac.findImpl(searcher, false)))
-                .map(JavaClass::getFullName)
+                .map(JavaClass::getRawName)
                 .orElse(null);
     }
 

@@ -142,7 +142,7 @@ cd java_analyzer
 | `--components` | 仅运行组件权限分析 |
 | `--aidl` | 仅运行 Java AIDL 接口搜索 |
 | `--ignore-registered` | 不按 `service_list.txt` 过滤，输出全部 AIDL 接口 |
-| （默认） | 两个分析都运行 |
+| （默认） | 两个分析都运行；AIDL 实现类统一输出底层真实原生字节码类名（Raw Class Name，如 `$1`，避免 JADX 的 `AnonymousClass` 反混淆重命名），保证与 Frida、Xposed 及 Java 反射环境完全兼容 |
 
 JVM 默认 `-XX:MaxRAMPercentage=50.0`（分配当前设备内存的 50%），可用 `JAVA_OPTS` 覆盖：`JAVA_OPTS="-Xmx8g" ./analyzer.sh ...`
 
