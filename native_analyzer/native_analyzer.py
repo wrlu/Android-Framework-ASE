@@ -525,8 +525,12 @@ def load_java_server_descriptors(workspace):
     return java_servers
 
 
+_demangle_unavailable_warned = False
+
+
 def demangle_symbols(symbols):
     """Demangle a list of C++ symbol names using c++filt or llvm-cxxfilt if available."""
+    global _demangle_unavailable_warned
     if not symbols:
         return {}
     cfilt = shutil.which('c++filt') or shutil.which('llvm-cxxfilt')
@@ -550,6 +554,9 @@ def demangle_symbols(symbols):
             return res
         except Exception as e:
             logger.debug('c++filt failed: %s', e)
+    if not _demangle_unavailable_warned:
+        logger.warning('c++filt/llvm-cxxfilt not found; C++ method signatures will be omitted')
+        _demangle_unavailable_warned = True
     return {s: s for s in symbols}
 
 
@@ -716,6 +723,11 @@ def load_accessible_services(workspace, name_to_desc):
     """
     accessible_file = Path(workspace) / 'accessible_services.txt'
     if not accessible_file.exists():
+        return None
+
+    if not name_to_desc:
+        logger.warning('accessible_services.txt found but service_list.txt is missing/empty; '
+                       'cannot map service names to descriptors, skipping accessibility output')
         return None
 
     by_desc = {}

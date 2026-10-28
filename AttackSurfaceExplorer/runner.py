@@ -40,11 +40,27 @@ DEVICE_TMP_RESULT = '/data/local/tmp/ase_result.json'
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 ASE_CLASSES_DIR = SCRIPT_DIR / 'app' / 'build' / 'intermediates' / 'javac' / 'release' / 'compileReleaseJavaWithJavac' / 'classes'
+GRADLEW = SCRIPT_DIR / 'gradlew'
 
 
-def run_cmd(cmd, check=False):
+def run_cmd(cmd, check=False, cwd=None):
     """Execute a local shell command and return CompletedProcess."""
-    return subprocess.run(cmd, capture_output=True, text=True, check=check)
+    return subprocess.run(cmd, capture_output=True, text=True, check=check, cwd=cwd)
+
+
+def ensure_ase_classes():
+    """Ensure ASE Java classes exist so scripts importing net.wrlu.ase.* can compile."""
+    if ASE_CLASSES_DIR.is_dir():
+        return
+    logger.info('[Compile] ASE classes not found, building them with Gradle...')
+    if not GRADLEW.is_file():
+        raise RuntimeError(
+            f'ASE classes not found ({ASE_CLASSES_DIR}) and {GRADLEW} is missing. '
+            'Build AttackSurfaceExplorer first: ./gradlew :app:assembleRelease')
+    res = run_cmd([str(GRADLEW), ':app:compileReleaseJavaWithJavac'], cwd=str(SCRIPT_DIR))
+    if res.returncode != 0 or not ASE_CLASSES_DIR.is_dir():
+        detail = (res.stderr or res.stdout or '').strip()
+        raise RuntimeError(f'Failed to build ASE classes:\n{detail}')
 
 
 def find_android_sdk():
@@ -129,8 +145,8 @@ def compile_java_to_dex(java_file, output_dex):
     logger.info('[Compile] android.jar: %s', android_jar)
 
     classpath_parts = [android_jar]
-    if ASE_CLASSES_DIR.is_dir():
-        classpath_parts.append(str(ASE_CLASSES_DIR))
+    ensure_ase_classes()
+    classpath_parts.append(str(ASE_CLASSES_DIR))
     classpath = os.pathsep.join(classpath_parts)
 
     with tempfile.TemporaryDirectory() as td:
@@ -186,11 +202,13 @@ def execute_on_device(device, dex_path, entry_class, args='', timeout=30):
     device.shell('mkdir', '-p', f'/sdcard/Android/data/{ASE_PACKAGE}/cache/')
     device.shell('cp', DEVICE_TMP_DEX, f'/sdcard/Android/data/{ASE_PACKAGE}/cache/ase_script.dex')
 
-    # 2. Reset previous result in cache
+    # 2. Reset previous external result and snapshot the current one (stale detection)
     device.shell('rm', '-f', f'/sdcard/Android/data/{ASE_PACKAGE}/cache/script_result.json')
+    baseline = query_script_result(device)
 
-    # 3. Start foreground service
-    logger.info('[ADB] Start ScriptExecutionService (:runner process)')
+    # 3. Start foreground service with a unique run id
+    run_id = str(int(time.time() * 1000))
+    logger.info('[ADB] Start ScriptExecutionService (:runner process), run_id=%s', run_id)
     start_cmd = [
         'am', 'start-foreground-service',
         '-n', ASE_SERVICE,
@@ -198,12 +216,13 @@ def execute_on_device(device, dex_path, entry_class, args='', timeout=30):
         '--es', 'entry_class', entry_class,
         '--es', 'args', args,
         '--es', 'result_file', DEVICE_TMP_RESULT,
+        '--es', 'run_id', run_id,
     ]
     r = device.shell(*start_cmd)
     if r.returncode != 0:
         logger.warning('am start-foreground-service output: %s', r.stderr)
 
-    # 4. Poll for result via DataProvider or cache file
+    # 4. Poll for a result that belongs to this run
     logger.info('[Runner] Waiting for execution result (timeout %ds)...', timeout)
     start_time = time.time()
     last_poll_output = None
@@ -212,30 +231,48 @@ def execute_on_device(device, dex_path, entry_class, args='', timeout=30):
         time.sleep(0.3)
 
         # Strategy A: DataProvider query
-        q = device.shell('content', 'query', '--uri', ASE_RESULT_URI)
-        if q.returncode == 0 and 'status=' in q.stdout:
-            last_poll_output = q.stdout
-            status = extract_field(q.stdout, 'status')
-            if status in ('success', 'error'):
-                json_str = extract_json_field(q.stdout)
-                if json_str:
-                    try:
-                        return json.loads(json_str)
-                    except json.JSONDecodeError:
-                        pass
-                return parse_cursor_output(q.stdout)
+        candidate = query_script_result(device)
+        if candidate:
+            last_poll_output = candidate
+            if is_fresh_result(candidate, run_id, baseline):
+                return candidate
 
         # Strategy B: App cache file
         cat = device.shell('cat', f'/sdcard/Android/data/{ASE_PACKAGE}/cache/script_result.json')
         if cat.returncode == 0 and cat.stdout.strip().startswith('{'):
             try:
                 res = json.loads(cat.stdout.strip())
-                if res.get('status') in ('success', 'error'):
+                if is_fresh_result(res, run_id, baseline):
                     return res
             except json.JSONDecodeError:
                 pass
 
     raise TimeoutError(f'Script execution timed out after {timeout}s. Last output:\n{last_poll_output}')
+
+
+def query_script_result(device):
+    """Return the provider's current script_result as a dict ({} when unavailable)."""
+    q = device.shell('content', 'query', '--uri', ASE_RESULT_URI)
+    if q.returncode != 0 or 'status=' not in q.stdout:
+        return {}
+    json_str = extract_json_field(q.stdout)
+    if json_str:
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            pass
+    return parse_cursor_output(q.stdout)
+
+
+def is_fresh_result(candidate, run_id, baseline):
+    """Accept a result only if it belongs to this run; for older APKs, require a new timestamp."""
+    if not candidate or candidate.get('status') not in ('success', 'error'):
+        return False
+    if candidate.get('run_id') == run_id:
+        return True
+    if candidate.get('run_id') is None:
+        return candidate.get('timestamp') != baseline.get('timestamp')
+    return False
 
 
 def extract_field(text, field_name):
@@ -261,12 +298,15 @@ def extract_json_field(text):
 
 
 def parse_cursor_output(text):
+    timestamp = extract_field(text, 'timestamp')
     return {
         'status': extract_field(text, 'status'),
         'result': extract_field(text, 'result'),
         'stdout': extract_field(text, 'stdout'),
         'error': extract_field(text, 'error'),
         'elapsed_ms': int(extract_field(text, 'elapsed_ms') or 0),
+        'run_id': extract_field(text, 'run_id') or None,
+        'timestamp': int(timestamp) if timestamp else None,
     }
 
 

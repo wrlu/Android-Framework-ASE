@@ -95,7 +95,7 @@ public class TestServiceProbe implements AseScript {
 }
 ```
 
-更多示例可参考 [sample_scripts/](sample_scripts/) 目录。
+示例脚本位于 [sample_scripts/](sample_scripts/)（当前提供 `TestServiceProbe.java`）。
 
 ### 4. 运行与参数
 
@@ -135,9 +135,18 @@ python3 runner.py sample_scripts/TestServiceProbe.java -d <serial> -o result.jso
 
 ---
 
+## 权限边界
+
+- **DataProvider**：通过 `Binder.getCallingUid()` 限制调用方，仅本应用、system(1000)、adb shell(2000) 与 root(0) 可查询。
+- **ScriptExecutionService**：导出的前台服务声明 `android:permission="android.permission.DUMP"`。shell 与 root 持有 DUMP，普通三方应用没有，因此只有 shell/root 能触发动态脚本执行；HiddenApiBypass 全豁免仅在该服务的 `:runner` 进程启用。
+
+---
+
 ## 编译与签名
 
 仓库已内置预编译好的 release 包：`AttackSurfaceExplorer/app-release.apk`，使用内置的 `ase-release.jks`（信息匿名化）进行签名。
+
+> 注意：`ase-release.jks` 与其口令随仓库公开，仅用于避免 debug 签名、方便内部分发；请勿将此包作为正式对外发布产物。
 
 若修改了 Java 源码需重新构建：
 
@@ -145,3 +154,5 @@ python3 runner.py sample_scripts/TestServiceProbe.java -d <serial> -o result.jso
 ./gradlew :app:assembleRelease
 adb install -r -g app/build/outputs/apk/release/app-release.apk
 ```
+
+`runner.py` 编译 Java 脚本时会用到 ASE 的 classes（`app/build/intermediates/javac/release/.../classes`）；若不存在会自动执行 `./gradlew :app:compileReleaseJavaWithJavac`，也可先手动构建。

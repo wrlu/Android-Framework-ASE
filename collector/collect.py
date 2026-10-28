@@ -154,9 +154,13 @@ def select_device(pre_select_serial=None):
         else:
             logger.info('%d => %s\t%s', i, dev.serial, dev.status)
 
-    select = int(input())
+    try:
+        select = int(input())
+    except (ValueError, EOFError):
+        logger.error('Invalid selection.')
+        return None
     logger.info('You select device on line %d', select)
-    if select > len(devices):
+    if select < 1 or select > len(devices):
         logger.error('Out of range.')
         return None
     dev = devices[select - 1]
@@ -180,13 +184,13 @@ def list_packages(device, scope='all'):
 def parse_pm_list(output, with_uid=False):
     items = []
     for line in output.split('\n'):
-        line = line.strip().strip('package:')
+        line = line.strip().removeprefix('package:')
         if with_uid:
             if '=' in line and ' ' in line:
                 path = line[:line.rindex('=')]
                 rest = line[line.rindex('=') + 1:]
                 name = rest[:rest.rindex(' ')]
-                uid = rest[rest.rindex(' ') + 1:].strip('uid:')
+                uid = rest[rest.rindex(' ') + 1:].removeprefix('uid:')
                 if ',' in uid:
                     uid = uid.split(',')[0]
                 items.append({'package_name': name, 'path': path, 'uid': uid})
@@ -374,8 +378,9 @@ def dump_readable_files(device, remote_path, local_dest):
     preserving relative directory structure.
     """
     os.makedirs(local_dest, exist_ok=True)
-    cmd = (f'for f in {remote_path}/* {remote_path}/*/* {remote_path}/*/*/*; do '
-           'if [ -r "$f" ] && [ -f "$f" ]; then echo "$f"; fi; done')
+    # Enumerate arbitrarily deep regular files; the previous fixed three-level glob missed
+    # deeper entries. Unreadable files simply fail pull() and are skipped.
+    cmd = f'find {remote_path} -type f 2>/dev/null'
     out = device.shell(cmd).decode('ascii', errors='ignore').strip()
     if not out:
         return 0
@@ -709,7 +714,7 @@ def main():
 
     device = select_device(args.device)
     if device is None:
-        return
+        sys.exit(1)
 
     if args.probe_only:
         logger.info('[Probe] Run binder service probe only')

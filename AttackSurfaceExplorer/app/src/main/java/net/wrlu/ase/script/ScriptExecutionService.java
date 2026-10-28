@@ -21,6 +21,7 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.FileWriter;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.PrintStream;
@@ -42,8 +43,12 @@ import dalvik.system.PathClassLoader;
  *       --es dex_path /data/local/tmp/ase_script.dex \
  *       --es entry_class com.example.MyScript \
  *       [--es args "my_arguments"] \
- *       [--es result_file /data/local/tmp/ase_result.json]
+ *       [--es result_file /data/local/tmp/ase_result.json] \
+ *       [--es run_id 1699999999999]
  * </pre>
+ *
+ * <p>The service is exported with {@code android.permission.DUMP} so only the shell and root
+ * (both hold DUMP) can trigger it; ordinary third-party apps are rejected by the framework.
  */
 public class ScriptExecutionService extends Service {
     private static final String TAG = "ASE_RUNNER";
@@ -102,10 +107,11 @@ public class ScriptExecutionService extends Service {
         String entryClass = intent.getStringExtra("entry_class");
         String args = intent.getStringExtra("args");
         String resultFile = intent.getStringExtra("result_file");
+        String runId = intent.getStringExtra("run_id");
 
         executor.execute(() -> {
             try {
-                executeScript(dexPath, entryClass, args, resultFile);
+                executeScript(dexPath, entryClass, args, resultFile, runId);
             } finally {
                 stopForegroundCompat();
                 stopSelf(startId);
@@ -123,7 +129,8 @@ public class ScriptExecutionService extends Service {
         }
     }
 
-    private void executeScript(String dexPath, String entryClass, String args, String resultFile) {
+    private void executeScript(String dexPath, String entryClass, String args, String resultFile,
+                               String runId) {
         long startTime = System.currentTimeMillis();
         JSONObject report = new JSONObject();
         PrintStream originalOut = System.out;
@@ -134,6 +141,9 @@ public class ScriptExecutionService extends Service {
             // Mark state as running
             report.put("status", "running");
             report.put("timestamp", startTime);
+            if (runId != null) {
+                report.put("run_id", runId);
+            }
             ScriptResultStore.saveResult(this, report);
 
             if (dexPath == null || dexPath.trim().isEmpty()) {
@@ -152,6 +162,10 @@ public class ScriptExecutionService extends Service {
             File codeCache = getCodeCacheDir();
             File activeDex = new File(codeCache, "active_payload_" + System.currentTimeMillis() + ".dex");
             copyFile(srcFile, activeDex);
+            // Android 14+ forbids loading writable DEX/JAR/APK: the file must be read-only.
+            if (!activeDex.setReadOnly()) {
+                throw new IllegalStateException("Failed to mark DEX read-only: " + activeDex);
+            }
 
             ClassLoader classLoader = new PathClassLoader(activeDex.getAbsolutePath(), getClassLoader());
             Class<?> clazz = Class.forName(entryClass, true, classLoader);
@@ -201,16 +215,43 @@ public class ScriptExecutionService extends Service {
         if (resultFile != null && !resultFile.trim().isEmpty()) {
             try {
                 File rf = new File(resultFile.trim());
-                File parent = rf.getParentFile();
-                if (parent != null && !parent.exists()) {
-                    parent.mkdirs();
-                }
-                try (FileWriter fw = new FileWriter(rf)) {
-                    fw.write(report.toString());
+                if (!isAllowedResultPath(rf)) {
+                    Log.w(TAG, "Refusing to write result_file outside allowed directories: " + resultFile);
+                } else {
+                    File parent = rf.getParentFile();
+                    if (parent != null && !parent.exists()) {
+                        parent.mkdirs();
+                    }
+                    try (FileWriter fw = new FileWriter(rf)) {
+                        fw.write(report.toString());
+                    }
                 }
             } catch (Throwable t) {
                 Log.w(TAG, "Could not write to requested result_file (" + resultFile + "): " + t.getMessage());
             }
+        }
+    }
+
+    /**
+     * Only allow result_file inside app-owned directories or the conventional shell temp dir.
+     * The path is canonicalized first so symlinks cannot escape an allowed directory.
+     */
+    private boolean isAllowedResultPath(File file) {
+        try {
+            String path = file.getCanonicalPath();
+            File[] allowedDirs = {
+                    getCacheDir(), getCodeCacheDir(), getFilesDir(), getExternalCacheDir()
+            };
+            for (File dir : allowedDirs) {
+                if (dir == null) continue;
+                String allowed = dir.getCanonicalPath();
+                if (path.equals(allowed) || path.startsWith(allowed + File.separator)) {
+                    return true;
+                }
+            }
+            return path.startsWith("/data/local/tmp/");
+        } catch (IOException e) {
+            return false;
         }
     }
 

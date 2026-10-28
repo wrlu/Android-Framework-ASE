@@ -152,45 +152,21 @@ public class ComponentAnalyzer {
             status.put("writePermission", "blank");
 
             if ("provider".equals(component.type)) {
-                String[] keywords = {"writePermission", "readPermission", "permission"};
-                for (String key : keywords) {
-                    String val = getField(component, key);
-                    if (val != null && !val.isEmpty()) {
-                        status.put(key, "undefined");
-                        for (DefinedPermission dp : allDefined) {
-                            if (dp.name != null && dp.name.equals(val)) {
-                                if (isPermissionPrivileged(dp)) {
-                                    status.put(key, "privileged");
-                                } else {
-                                    status.put(key, "unprivileged");
-                                }
-                                break;
-                            }
-                        }
-                    } else {
-                        status.put(key, "unprivileged");
-                    }
-                }
+                // Android resolves provider permissions as: read = readPermission ?: permission,
+                // write = writePermission ?: permission (explicit read/write override the generic
+                // permission). Evaluate the effective permissions so a privileged android:permission
+                // cannot hide a weaker explicit readPermission/writePermission.
+                String effRead = firstNonEmpty(component.readPermission, component.permission);
+                String effWrite = firstNonEmpty(component.writePermission, component.permission);
+                String readStatus = classifyPermission(effRead, allDefined);
+                String writeStatus = classifyPermission(effWrite, allDefined);
 
-                boolean appended = false;
-                if ("unprivileged".equals(status.get("permission"))) {
-                    if ("undefined".equals(status.get("writePermission")) || "undefined".equals(status.get("readPermission"))) {
-                        issues.get("provider").add(providerIssueMap(component, "undefined"));
-                        appended = true;
-                    } else if ("unprivileged".equals(status.get("writePermission")) || "unprivileged".equals(status.get("readPermission"))) {
-                        issues.get("provider").add(providerIssueMap(component, "unprivileged"));
-                        appended = true;
-                    }
-                } else if ("undefined".equals(status.get("permission"))) {
-                    if ("unprivileged".equals(status.get("writePermission")) || "unprivileged".equals(status.get("readPermission"))) {
-                        issues.get("provider").add(providerIssueMap(component, "undefined"));
-                        appended = true;
-                    } else if ("undefined".equals(status.get("writePermission")) || "undefined".equals(status.get("readPermission"))) {
-                        issues.get("provider").add(providerIssueMap(component, "undefined"));
-                        appended = true;
-                    }
+                if (isWeakPermission(readStatus) || isWeakPermission(writeStatus)) {
+                    boolean undefined = "undefined".equals(readStatus) || "undefined".equals(writeStatus);
+                    issues.get("provider").add(providerIssueMap(component,
+                            undefined ? "undefined" : "unprivileged"));
+                    continue;
                 }
-                if (appended) continue;
 
                 if (component.pathPermission != null) {
                     boolean found = false;
@@ -243,16 +219,17 @@ public class ComponentAnalyzer {
                     status.put("permission", "unprivileged");
                 }
 
-                if ("receiver".equals(component.type)) {
+                if ("receiver".equals(component.type)
+                        && component.actions != null && !component.actions.isEmpty()) {
                     boolean hasUnprotectedAction = false;
-                    if (component.actions != null) {
-                        for (String action : component.actions) {
-                            if (!allProtected.contains(action)) {
-                                hasUnprotectedAction = true;
-                                break;
-                            }
+                    for (String action : component.actions) {
+                        if (!allProtected.contains(action)) {
+                            hasUnprotectedAction = true;
+                            break;
                         }
                     }
+                    // Only skip receivers whose declared actions are all protected. Receivers with
+                    // no action are still reachable through explicit intents and must be evaluated.
                     if (!hasUnprotectedAction) continue;
                 }
 
@@ -274,15 +251,38 @@ public class ComponentAnalyzer {
         return (level & (0x2 | 0x10 | 0x20 | 0x40 | 0x4000)) != 0;
     }
 
-    private static int parseProtectionLevel(String level) {
-        try {
-            return Integer.parseInt(level, 10);
-        } catch (NumberFormatException e1) {
-            try {
-                return Integer.parseInt(level, 16);
-            } catch (NumberFormatException e2) {
-                return mapProtectionLevelName(level);
+    private static String firstNonEmpty(String primary, String fallback) {
+        return (primary != null && !primary.isEmpty()) ? primary : fallback;
+    }
+
+    /**
+     * Classify a permission name as {@code privileged}, {@code unprivileged} or {@code undefined}
+     * (declared by the component but not defined by any collected package). A null/empty name means
+     * the component is unprotected, i.e. {@code unprivileged}.
+     */
+    private static String classifyPermission(String name, List<DefinedPermission> allDefined) {
+        if (name == null || name.isEmpty()) return "unprivileged";
+        for (DefinedPermission dp : allDefined) {
+            if (dp.name != null && dp.name.equals(name)) {
+                return isPermissionPrivileged(dp) ? "privileged" : "unprivileged";
             }
+        }
+        return "undefined";
+    }
+
+    private static boolean isWeakPermission(String status) {
+        return "unprivileged".equals(status) || "undefined".equals(status);
+    }
+
+    private static int parseProtectionLevel(String level) {
+        String value = level.trim();
+        try {
+            if (value.startsWith("0x") || value.startsWith("0X")) {
+                return Integer.parseInt(value.substring(2), 16);
+            }
+            return Integer.parseInt(value, 10);
+        } catch (NumberFormatException e) {
+            return mapProtectionLevelName(value);
         }
     }
 

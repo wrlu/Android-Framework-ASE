@@ -34,6 +34,7 @@
         <service
             android:name=".script.ScriptExecutionService"
             android:exported="true"
+            android:permission="android.permission.DUMP"
             android:process=":runner"
             android:foregroundServiceType="specialUse">
             <property

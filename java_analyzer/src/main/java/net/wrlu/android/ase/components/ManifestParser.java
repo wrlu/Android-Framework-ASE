@@ -11,7 +11,9 @@ import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 import java.io.StringReader;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class ManifestParser {
     private static final Logger logger = LoggerFactory.getLogger(ManifestParser.class);
@@ -39,6 +41,7 @@ public class ManifestParser {
 
             List<Component> components = new ArrayList<>();
             components.addAll(collectActivities(application, info.packageName));
+            components.addAll(collectActivityAliases(application, info.packageName));
             components.addAll(collectServices(application, info.packageName));
             components.addAll(collectProviders(application, info.packageName));
             components.addAll(collectReceivers(application, info.packageName));
@@ -103,6 +106,55 @@ public class ManifestParser {
             }
         }
         return list;
+    }
+
+    /**
+     * Collect exported {@code <activity-alias>} entries. An alias is itself an addressable
+     * component; when it declares no permission it inherits the target activity's permission.
+     */
+    private static List<Component> collectActivityAliases(Element application, String packageName) {
+        Map<String, String> activityPermissions = new HashMap<>();
+        NodeList activities = application.getElementsByTagName("activity");
+        for (int i = 0; i < activities.getLength(); i++) {
+            Element activity = (Element) activities.item(i);
+            activityPermissions.put(
+                    fullyQualifiedName(activity.getAttribute("android:name"), packageName),
+                    activity.getAttribute("android:permission"));
+        }
+
+        List<Component> list = new ArrayList<>();
+        NodeList nodes = application.getElementsByTagName("activity-alias");
+        for (int i = 0; i < nodes.getLength(); i++) {
+            Element el = (Element) nodes.item(i);
+            String name = el.getAttribute("android:name");
+            if (name == null || name.isEmpty()) continue;
+            if (!isComponentExported(el)) continue;
+
+            Component c = new Component();
+            c.name = packageName + "/" + name;
+            c.type = "activity";
+            c.permission = el.getAttribute("android:permission");
+            if (c.permission == null || c.permission.isEmpty()) {
+                String target = fullyQualifiedName(
+                        el.getAttribute("android:targetActivity"), packageName);
+                String inherited = activityPermissions.get(target);
+                if (inherited != null) {
+                    c.permission = inherited;
+                }
+            }
+            if (isActivityBrowsable(el)) {
+                c.intentFilters = collectIntentFilters(el);
+            }
+            list.add(c);
+        }
+        return list;
+    }
+
+    private static String fullyQualifiedName(String name, String packageName) {
+        if (name == null || name.isEmpty()) return name;
+        if (name.startsWith(".")) return packageName + name;
+        if (name.indexOf('.') < 0) return packageName + "." + name;
+        return name;
     }
 
     private static List<Component> collectServices(Element application, String packageName) {

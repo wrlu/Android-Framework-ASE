@@ -41,7 +41,7 @@ Android 固件攻击面分析工具，覆盖「固件采集 → 静态分析 →
 
 | 依赖 | 版本 | 用途 |
 |------|------|------|
-| Python | 3.8+ | collector、native_analyzer、post_analyzer |
+| Python | 3.9+ | collector、native_analyzer、post_analyzer |
 | adb | 1.0.41+ | collector |
 | JDK | 21+ | java_analyzer |
 | Gradle | 8.5+ | java_analyzer（仓库自带 wrapper） |
@@ -226,6 +226,8 @@ python3 native_analyzer.py <workspace_dir> [--ignore-registered]
 5. **service_list 交叉引用** — 默认仅保留已注册 descriptor，`--ignore-registered` 输出全部 server 接口；
 6. **AIDL 方法签名还原** — 自动交叉引用 Java 提取的 `service_aidl.txt`；对纯 Native 接口，解析 ELF 动态符号表中 `Bp{Name}` 客户端代理类导出符号，还原具体 AIDL 业务方法；
 7. **onTransact 入口定位** — 匹配服务端 `Bn{Name}::onTransact`（C++）或 `on_transact`（Rust）函数虚地址偏移，输出 `[onTransact=0x...]` 标记。
+
+> 注：第 6 项的 C++ 方法签名 demangle 依赖系统的 `c++filt`（binutils）或 `llvm-cxxfilt`；两者都缺失时会告警并跳过方法签名还原（不影响 descriptor 与服务端判定）。
 
 | 输出 | 说明 |
 |------|------|
