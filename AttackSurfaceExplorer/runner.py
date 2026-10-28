@@ -35,7 +35,6 @@ ASE_PACKAGE = 'net.wrlu.ase'
 ASE_SERVICE = f'{ASE_PACKAGE}/.script.ScriptExecutionService'
 ASE_RESULT_URI = 'content://net.wrlu.ase.probe/script_result'
 DEVICE_TMP_DEX = '/data/local/tmp/ase_script.dex'
-DEVICE_TMP_RESULT = '/data/local/tmp/ase_result.json'
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
@@ -215,7 +214,6 @@ def execute_on_device(device, dex_path, entry_class, args='', timeout=30):
         '--es', 'dex_path', DEVICE_TMP_DEX,
         '--es', 'entry_class', entry_class,
         '--es', 'args', args,
-        '--es', 'result_file', DEVICE_TMP_RESULT,
         '--es', 'run_id', run_id,
     ]
     r = device.shell(*start_cmd)

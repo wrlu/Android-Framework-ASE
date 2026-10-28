@@ -146,11 +146,6 @@ public class ComponentAnalyzer {
         Map<String, List<Map<String, Object>>> issues = initBuckets();
 
         for (Component component : allComponents) {
-            Map<String, String> status = new LinkedHashMap<>();
-            status.put("permission", "blank");
-            status.put("readPermission", "blank");
-            status.put("writePermission", "blank");
-
             if ("provider".equals(component.type)) {
                 // Android resolves provider permissions as: read = readPermission ?: permission,
                 // write = writePermission ?: permission (explicit read/write override the generic
@@ -202,6 +197,8 @@ public class ComponentAnalyzer {
                     }
                 }
             } else {
+                Map<String, String> status = new LinkedHashMap<>();
+                status.put("permission", "blank");
                 String perm = component.permission;
                 if (perm != null && !perm.isEmpty()) {
                     status.put("permission", "undefined");
@@ -306,15 +303,6 @@ public class ComponentAnalyzer {
             }
         }
         return result;
-    }
-
-    private static String getField(Component c, String key) {
-        switch (key) {
-            case "permission": return c.permission;
-            case "readPermission": return c.readPermission;
-            case "writePermission": return c.writePermission;
-            default: return null;
-        }
     }
 
     private static String getPathPermField(PathPermission pp, String key) {

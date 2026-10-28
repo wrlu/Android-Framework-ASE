@@ -8,3 +8,6 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Built ASE APK (not tracked; collector/runner builds it on demand)
+/app-release.apk

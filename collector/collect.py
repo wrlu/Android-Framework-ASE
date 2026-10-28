@@ -23,7 +23,13 @@ ASE_PROJECT_DIR = os.path.normpath(os.path.join(
 PREBUILT_ASE_APK = os.path.normpath(os.path.join(ASE_PROJECT_DIR, 'app-release.apk'))
 BUILT_ASE_APK = os.path.normpath(os.path.join(
     ASE_PROJECT_DIR, 'app', 'build', 'outputs', 'apk', 'release', 'app-release.apk'))
-DEFAULT_ASE_APK = PREBUILT_ASE_APK
+ASE_SOURCE_PATHS = [
+    os.path.join(ASE_PROJECT_DIR, 'app', 'src'),
+    os.path.join(ASE_PROJECT_DIR, 'app', 'build.gradle.kts'),
+    os.path.join(ASE_PROJECT_DIR, 'build.gradle.kts'),
+    os.path.join(ASE_PROJECT_DIR, 'settings.gradle.kts'),
+    os.path.join(ASE_PROJECT_DIR, 'gradle'),
+]
 
 
 def run_command(cmds, cwd='.'):
@@ -569,14 +575,32 @@ def build_ase_apk():
     return True
 
 
+def apk_is_fresh(apk_path):
+    """Return True when apk_path is at least as new as every ASE source/build file."""
+    try:
+        apk_mtime = os.path.getmtime(apk_path)
+    except OSError:
+        return False
+    for path in ASE_SOURCE_PATHS:
+        if os.path.isfile(path):
+            if os.path.getmtime(path) > apk_mtime:
+                return False
+        elif os.path.isdir(path):
+            for root, _, files in os.walk(path):
+                for name in files:
+                    if os.path.getmtime(os.path.join(root, name)) > apk_mtime:
+                        return False
+    return True
+
+
 def resolve_ase_apk(user_specified_apk=None):
     """Resolve which AttackSurfaceExplorer APK to use.
 
     Priority:
     1. User explicitly specified path (via --ase-apk).
-    2. Precompiled release APK in AttackSurfaceExplorer/app-release.apk.
-    3. Previously built APK in AttackSurfaceExplorer/app/build/.../app-release.apk.
-    4. Automatically trigger build via gradlew :app:assembleRelease.
+    2. Up-to-date built APK in AttackSurfaceExplorer/app/build/.../app-release.apk.
+    3. Optional local prebuilt AttackSurfaceExplorer/app-release.apk (not tracked in git).
+    4. Build via gradlew :app:assembleRelease (when missing or sources changed).
     """
     if user_specified_apk:
         if os.path.isfile(user_specified_apk):
@@ -584,18 +608,25 @@ def resolve_ase_apk(user_specified_apk=None):
         logger.warning('User-specified ASE APK not found: %s', user_specified_apk)
         return None
 
-    if os.path.isfile(PREBUILT_ASE_APK):
-        logger.info('Using precompiled AttackSurfaceExplorer APK: %s', PREBUILT_ASE_APK)
-        return PREBUILT_ASE_APK
-
-    if os.path.isfile(BUILT_ASE_APK):
-        logger.info('Using existing built AttackSurfaceExplorer APK: %s', BUILT_ASE_APK)
+    if os.path.isfile(BUILT_ASE_APK) and apk_is_fresh(BUILT_ASE_APK):
+        logger.info('Using up-to-date built AttackSurfaceExplorer APK: %s', BUILT_ASE_APK)
         return BUILT_ASE_APK
 
-    logger.info('No precompiled or built APK found, building AttackSurfaceExplorer release APK...')
+    if os.path.isfile(PREBUILT_ASE_APK) and apk_is_fresh(PREBUILT_ASE_APK):
+        logger.info('Using up-to-date prebuilt AttackSurfaceExplorer APK: %s', PREBUILT_ASE_APK)
+        return PREBUILT_ASE_APK
+
+    logger.info('AttackSurfaceExplorer APK missing or stale, building release APK...')
     if build_ase_apk() and os.path.isfile(BUILT_ASE_APK):
         return BUILT_ASE_APK
 
+    # Last resort: use whatever exists, even if it may be stale.
+    if os.path.isfile(PREBUILT_ASE_APK):
+        logger.warning('Build failed; falling back to possibly stale prebuilt APK: %s', PREBUILT_ASE_APK)
+        return PREBUILT_ASE_APK
+    if os.path.isfile(BUILT_ASE_APK):
+        logger.warning('Build failed; falling back to possibly stale built APK: %s', BUILT_ASE_APK)
+        return BUILT_ASE_APK
     return None
 
 
@@ -689,7 +720,7 @@ def main():
     parser.add_argument('-o', '--output', help='Output directory for dumped firmware (default: current directory).')
     parser.add_argument('-d', '--device', help='adb serial id (non-interactive selection).')
     parser.add_argument('--ase-apk', help='AttackSurfaceExplorer APK installed before probing '
-                                         '(default: precompiled AttackSurfaceExplorer/app-release.apk).')
+                                         '(default: auto-build/reuse app/build/outputs/apk/release/app-release.apk).')
     parser.add_argument('--probe-only', action='store_true',
                         help='Only run the binder service accessibility probe and generate accessible_services.txt.')
     parser.add_argument('--apex-only', action='store_true',

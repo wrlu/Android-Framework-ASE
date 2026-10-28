@@ -18,7 +18,7 @@ AttackSurfaceExplorer 以 **APK 自身 UID（普通 untrusted_app 沙箱）** �
 - 探测结果通过通用的 `ContentProvider` 导出。
 
 ### 2. 配合 Collector 自动工作
-在运行 `collector/collect.py` 或根目录 `run.sh` 时，工具会自动将预编译的 `app-release.apk` 覆盖安装（`adb install -r -g`）至目标设备，自动查询该 Provider 并保存为 `accessible_services.txt`，供后续 Java / Native AIDL 分析使用。
+在运行 `collector/collect.py` 或根目录 `run.sh` 时，工具会自动构建（首次或源码变更时，通过 Gradle wrapper）并覆盖安装 release APK（`adb install -r -g`）至目标设备，自动查询该 Provider 并保存为 `accessible_services.txt`，供后续 Java / Native AIDL 分析使用。
 
 ### 3. 手动调试与查询命令
 
@@ -144,11 +144,11 @@ python3 runner.py sample_scripts/TestServiceProbe.java -d <serial> -o result.jso
 
 ## 编译与签名
 
-仓库已内置预编译好的 release 包：`AttackSurfaceExplorer/app-release.apk`，使用内置的 `ase-release.jks`（信息匿名化）进行签名。
+仓库不提交 APK（构建产物）；`collector` 在 APK 缺失或源码更新时会自动构建并安装，也可手动构建。使用内置的 `ase-release.jks`（信息匿名化）进行签名。
 
 > 注意：`ase-release.jks` 与其口令随仓库公开，仅用于避免 debug 签名、方便内部分发；请勿将此包作为正式对外发布产物。
 
-若修改了 Java 源码需重新构建：
+手动构建：
 
 ```bash
 ./gradlew :app:assembleRelease

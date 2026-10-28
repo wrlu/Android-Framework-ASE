@@ -43,8 +43,10 @@ Android 固件攻击面分析工具，覆盖「固件采集 → 静态分析 →
 |------|------|------|
 | Python | 3.9+ | collector、native_analyzer、post_analyzer |
 | adb | 1.0.41+ | collector |
-| JDK | 21+ | java_analyzer |
-| Gradle | 8.5+ | java_analyzer（仓库自带 wrapper） |
+| JDK | 21+ | java_analyzer、AttackSurfaceExplorer 构建 |
+| Gradle | 8.5+ | java_analyzer、AttackSurfaceExplorer（仓库自带 wrapper） |
+| Android SDK | platform 37 / build-tools 37 | AttackSurfaceExplorer 构建（collector 自动构建时） |
+| c++filt / llvm-cxxfilt | 任选其一（可选） | native_analyzer 还原 C++ 方法签名 |
 
 ## 一键全流程（One-Click Pipeline）
 
@@ -79,7 +81,7 @@ python3 collect.py -o <output_dir> [-d <device_serial>] [-s | -3]
 |------|------|
 | `-o, --output` | 输出目录（默认当前目录） |
 | `-d, --device` | adb 设备 serial（非交互选择） |
-| `--ase-apk` | 探测用 AttackSurfaceExplorer APK 路径（默认优先使用预编译 `../AttackSurfaceExplorer/app-release.apk`） |
+| `--ase-apk` | 探测用 AttackSurfaceExplorer APK 路径（默认自动复用/构建 `../AttackSurfaceExplorer/app/build/outputs/apk/release/app-release.apk`） |
 | `--probe-only` | 仅安装 APK 并生成 `accessible_services.txt`，不 dump 固件 |
 | `--apex-only` | 仅 dump APEX 包并生成 `apex_index.csv` |
 | `-s, --system` | 仅 dump 系统包 |
@@ -100,7 +102,7 @@ python3 collect.py -o <output_dir> [-d <device_serial>] [-s | -3]
 
 静态分析只能识别系统镜像中存在哪些 AIDL 接口与实现类，无法得知在真实设备运行环境中，厂商定制的 SELinux 策略、SELinux ioctl 规则、UID/GID 校验是否会在底层阻断三方普通应用获取特定系统服务。
 
-因此，`collector` 在采集运行元数据阶段，会自动将预编译的 **AttackSurfaceExplorer** APK（`app-release.apk`）推送到设备并调用其内置的 **`BinderProber`**：
+因此，`collector` 在采集运行元数据阶段，会自动构建（首次或 ASE 源码变更时）并安装 **AttackSurfaceExplorer** release APK，然后调用其内置的 **`BinderProber`**：
 
 1. **探测原理**：
    - 以普通应用沙箱身份（`untrusted_app`，标准 App UID）通过私有 API 反射调用 `ServiceManager.getService(name)`；
@@ -217,7 +219,7 @@ cd native_analyzer
 python3 native_analyzer.py <workspace_dir> [--ignore-registered]
 ```
 
-无需构建、无外部依赖。扫描各分区 `lib(64)`、`bin`（含 `bin/hw`）以及 `apex/` 容器下的全部 ELF 二进制：
+无需构建、无 Python 第三方依赖（C++ 方法签名还原可选依赖 `c++filt`/`llvm-cxxfilt`）。扫描各分区 `lib(64)`、`bin`（含 `bin/hw`）以及 `apex/` 容器下的全部 ELF 二进制：
 
 1. **Descriptor 提取** — 匹配标准 AIDL 字符串模式、C++ libbinder 的 UTF-16LE String16 常量（如 `SurfaceFlinger`、`IAudioFlingerService`、`SensorServer` 等）、非标准命名接口（如 `ConnectivityNative`）与 Rust v0 mangling 符号；
 2. **多层服务端判定（解决 Strip 与 -fno-rtti 漏报）** — 结合 C++ Itanium ABI（`{len}Bn{Name}`）、Rust mangling、以及 ELF 动态符号表（`AIBinder_Class_define`、`AServiceManager_addService`、`defaultServiceManager` 等关键系统调用）；

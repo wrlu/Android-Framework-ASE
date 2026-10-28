@@ -160,6 +160,7 @@ public class ScriptExecutionService extends Service {
 
             // Copy to app's codeCacheDir to avoid W^X and SELinux execution blocks
             File codeCache = getCodeCacheDir();
+            deleteStalePayloads(codeCache);
             File activeDex = new File(codeCache, "active_payload_" + System.currentTimeMillis() + ".dex");
             copyFile(srcFile, activeDex);
             // Android 14+ forbids loading writable DEX/JAR/APK: the file must be read-only.
@@ -228,6 +229,21 @@ public class ScriptExecutionService extends Service {
                 }
             } catch (Throwable t) {
                 Log.w(TAG, "Could not write to requested result_file (" + resultFile + "): " + t.getMessage());
+            }
+        }
+    }
+
+    /** Remove payload copies from previous runs so the code cache does not grow without bound. */
+    private static void deleteStalePayloads(File codeCache) {
+        File[] stale = codeCache.listFiles(
+                (dir, name) -> name.startsWith("active_payload_") && name.endsWith(".dex"));
+        if (stale == null) {
+            return;
+        }
+        for (File file : stale) {
+            // Payloads are read-only, but the containing directory is app-owned so deletion works.
+            if (!file.delete()) {
+                Log.w(TAG, "Could not delete stale payload: " + file);
             }
         }
     }
