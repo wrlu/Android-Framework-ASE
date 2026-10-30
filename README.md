@@ -27,6 +27,8 @@ Android 固件攻击面分析工具，覆盖「固件采集 → 静态分析 →
 │   └── native_analyzer.py         # Native AIDL 扫描
 ├── post_analyzer/
 │   └── post_analyzer.py           # 后处理：求差集与盲区服务分析
+├── ase_shell/
+│   └── ase_shell.py               # dump 目录交互式检索（gdb 风格）
 └── AttackSurfaceExplorer/         # 设备端 Binder 探测与动态验证框架（详见子目录 README）
     ├── runner.py                  # 主机端动态脚本编译与执行工具
     ├── sample_scripts/            # 验证脚本示例
@@ -321,6 +323,28 @@ cd ../post_analyzer && python3 post_analyzer.py ~/firmware/pixel8
 # 可选：针对盲区服务或高危 AIDL 进行实机动态 PoC 验证
 cd ../AttackSurfaceExplorer && python3 runner.py sample_scripts/TestServiceProbe.java -a "service_name"
 ```
+
+## 交互式检索（ase_shell，框架）
+
+对已有 dump 目录进入类似 gdb 的交互模式：
+
+```bash
+python3 ase_shell/ase_shell.py <dump_dir>
+```
+
+当前只搭建了框架：REPL、命令注册、命令名 Tab 补全、历史记录，以及仅限 ASE 产物的路径范围校验。命令按 adb 子命令风格逐步实现，当前仅：
+
+| 命令 | 说明 |
+|------|------|
+| `pm list` / `pm list packages [filter]` | 列出包（`package:<name>`） |
+| `pm list <package>` | 显示包详情（uid、APK、组件、问题组件、权限） |
+| `pm uninstall <package>` | 删除本地 `packages/<package>/` 及对应记录（`package_index.csv`、`all_comp.json`、`accessible_comp.json`） |
+| `service list` | 列出全部系统服务（`Found N services:`，格式仿 adb） |
+| `service list <service>` | 显示单个服务信息：descriptor、可访问性、Java/Native AIDL（impl/so、backend、onTransact、展开的方法签名） |
+
+新增命令：在 `ase_shell/ase_shell.py` 中用 `@command(...)` 注册 `handler(ctx, argv)`；命令内通过 `ctx.resolve()` 取路径，确保只访问 ASE 产物。
+
+## 输出文件
 
 ## 输出文件
 
