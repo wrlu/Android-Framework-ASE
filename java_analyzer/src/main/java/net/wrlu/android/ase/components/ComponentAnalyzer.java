@@ -41,6 +41,9 @@ public class ComponentAnalyzer {
             if (baseData == null) {
                 logger.warn("Cached file invalid, re-scan: {}", allCompFile);
                 baseData = scanDir(packagesDir);
+            } else if (isLegacyCache(baseData)) {
+                logger.info("Cached file predates the exported flag, re-scan: {}", allCompFile);
+                baseData = scanDir(packagesDir);
             }
         } else {
             baseData = scanDir(packagesDir);
@@ -61,6 +64,23 @@ public class ComponentAnalyzer {
             GSON.toJson(result, fw);
         }
         logger.info("Component analysis done: {}", accessibleFile.getAbsolutePath());
+    }
+
+    /**
+     * Old all_comp.json files were written before the {@code exported} field existed and only
+     * contained exported components. Any component without a value means the cache must be
+     * rebuilt so the full (exported + non-exported) inventory is produced.
+     */
+    private static boolean isLegacyCache(List<PackageInfo> baseData) {
+        for (PackageInfo info : baseData) {
+            if (info.components == null) continue;
+            for (Component component : info.components) {
+                if (component.exported == null) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /**
@@ -146,6 +166,11 @@ public class ComponentAnalyzer {
         Map<String, List<Map<String, Object>>> issues = initBuckets();
 
         for (Component component : allComponents) {
+            // all_comp.json now contains every component; only exported ones are reachable
+            // by third-party apps and therefore belong in the issue report.
+            if (Boolean.FALSE.equals(component.exported)) {
+                continue;
+            }
             if ("provider".equals(component.type)) {
                 // Android resolves provider permissions as: read = readPermission ?: permission,
                 // write = writePermission ?: permission (explicit read/write override the generic

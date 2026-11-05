@@ -94,16 +94,15 @@ public class ManifestParser {
             Element el = (Element) nodes.item(i);
             String name = el.getAttribute("android:name");
             if (name == null || name.isEmpty()) continue;
-            if (isComponentExported(el)) {
-                Component c = new Component();
-                c.name = packageName + "/" + name;
-                c.type = "activity";
-                c.permission = el.getAttribute("android:permission");
-                if (isActivityBrowsable(el)) {
-                    c.intentFilters = collectIntentFilters(el);
-                }
-                list.add(c);
+            Component c = new Component();
+            c.name = packageName + "/" + name;
+            c.type = "activity";
+            c.exported = isComponentExported(el);
+            c.permission = el.getAttribute("android:permission");
+            if (isActivityBrowsable(el)) {
+                c.intentFilters = collectIntentFilters(el);
             }
+            list.add(c);
         }
         return list;
     }
@@ -128,11 +127,11 @@ public class ManifestParser {
             Element el = (Element) nodes.item(i);
             String name = el.getAttribute("android:name");
             if (name == null || name.isEmpty()) continue;
-            if (!isComponentExported(el)) continue;
 
             Component c = new Component();
             c.name = packageName + "/" + name;
             c.type = "activity";
+            c.exported = isComponentExported(el);
             c.permission = el.getAttribute("android:permission");
             if (c.permission == null || c.permission.isEmpty()) {
                 String target = fullyQualifiedName(
@@ -164,13 +163,12 @@ public class ManifestParser {
             Element el = (Element) nodes.item(i);
             String name = el.getAttribute("android:name");
             if (name == null || name.isEmpty()) continue;
-            if (isComponentExported(el)) {
-                Component c = new Component();
-                c.name = packageName + "/" + name;
-                c.type = "service";
-                c.permission = el.getAttribute("android:permission");
-                list.add(c);
-            }
+            Component c = new Component();
+            c.name = packageName + "/" + name;
+            c.type = "service";
+            c.exported = isComponentExported(el);
+            c.permission = el.getAttribute("android:permission");
+            list.add(c);
         }
         return list;
     }
@@ -182,36 +180,36 @@ public class ManifestParser {
             Element el = (Element) nodes.item(i);
             String name = el.getAttribute("android:name");
             if (name == null || name.isEmpty()) continue;
-            if (isComponentExported(el)) {
-                Component c = new Component();
-                c.name = packageName + "/" + name;
-                c.type = "provider";
-                c.permission = el.getAttribute("android:permission");
-                c.readPermission = el.getAttribute("android:readPermission");
-                c.writePermission = el.getAttribute("android:writePermission");
-                c.pathPermission = new ArrayList<>();
 
-                NodeList pathPerms = el.getElementsByTagName("path-permission");
-                for (int j = 0; j < pathPerms.getLength(); j++) {
-                    Element pp = (Element) pathPerms.item(j);
-                    String path = pp.getAttribute("android:path");
-                    String pathPrefix = pp.getAttribute("android:pathPrefix");
-                    String pathPattern = pp.getAttribute("android:pathPattern");
-                    String perm = pp.getAttribute("android:permission");
-                    String readPerm = pp.getAttribute("android:readPermission");
-                    String writePerm = pp.getAttribute("android:writePermission");
+            Component c = new Component();
+            c.name = packageName + "/" + name;
+            c.type = "provider";
+            c.exported = isComponentExported(el);
+            c.permission = el.getAttribute("android:permission");
+            c.readPermission = el.getAttribute("android:readPermission");
+            c.writePermission = el.getAttribute("android:writePermission");
+            c.pathPermission = new ArrayList<>();
 
-                    PathPermission p = new PathPermission();
-                    if (path != null && !path.isEmpty()) p.path = path;
-                    if (pathPrefix != null && !pathPrefix.isEmpty()) p.pathPrefix = pathPrefix;
-                    if (pathPattern != null && !pathPattern.isEmpty()) p.pathPattern = pathPattern;
-                    if (perm != null && !perm.isEmpty()) p.permission = perm;
-                    if (readPerm != null && !readPerm.isEmpty()) p.readPermission = readPerm;
-                    if (writePerm != null && !writePerm.isEmpty()) p.writePermission = writePerm;
-                    c.pathPermission.add(p);
-                }
-                list.add(c);
+            NodeList pathPerms = el.getElementsByTagName("path-permission");
+            for (int j = 0; j < pathPerms.getLength(); j++) {
+                Element pp = (Element) pathPerms.item(j);
+                String path = pp.getAttribute("android:path");
+                String pathPrefix = pp.getAttribute("android:pathPrefix");
+                String pathPattern = pp.getAttribute("android:pathPattern");
+                String perm = pp.getAttribute("android:permission");
+                String readPerm = pp.getAttribute("android:readPermission");
+                String writePerm = pp.getAttribute("android:writePermission");
+
+                PathPermission p = new PathPermission();
+                if (path != null && !path.isEmpty()) p.path = path;
+                if (pathPrefix != null && !pathPrefix.isEmpty()) p.pathPrefix = pathPrefix;
+                if (pathPattern != null && !pathPattern.isEmpty()) p.pathPattern = pathPattern;
+                if (perm != null && !perm.isEmpty()) p.permission = perm;
+                if (readPerm != null && !readPerm.isEmpty()) p.readPermission = readPerm;
+                if (writePerm != null && !writePerm.isEmpty()) p.writePermission = writePerm;
+                c.pathPermission.add(p);
             }
+            list.add(c);
         }
         return list;
     }
@@ -223,14 +221,14 @@ public class ManifestParser {
             Element el = (Element) nodes.item(i);
             String name = el.getAttribute("android:name");
             if (name == null || name.isEmpty()) continue;
-            if (isComponentExported(el)) {
-                Component c = new Component();
-                c.name = packageName + "/" + name;
-                c.type = "receiver";
-                c.permission = el.getAttribute("android:permission");
-                c.actions = getAllActionNames(el);
-                list.add(c);
-            }
+
+            Component c = new Component();
+            c.name = packageName + "/" + name;
+            c.type = "receiver";
+            c.exported = isComponentExported(el);
+            c.permission = el.getAttribute("android:permission");
+            c.actions = getAllActionNames(el);
+            list.add(c);
         }
         return list;
     }

@@ -156,8 +156,8 @@ JVM 默认 `-XX:MaxRAMPercentage=50.0`（分配当前设备内存的 50%），�
 
 | 输出 | 说明 |
 |------|------|
-| `all_comp.json` | 全量组件清单（包名、组件、定义权限、声明权限、protected-broadcast）；APK 路径为相对 workspace root 的相对路径 |
-| `accessible_comp.json` | 问题组件清单，按组件类型（activity / service / provider / receiver）分组，每条含 `type` 字段标记 `undefined`（权限未定义）或 `unprivileged`（保护级别不足） |
+| `all_comp.json` | 全量组件清单（含 `exported` 字段，导出与非导出组件均收录；包名、组件、定义权限、声明权限、protected-broadcast）；APK 路径为相对 workspace root 的相对路径 |
+| `accessible_comp.json` | 问题组件清单（仅针对导出组件），按组件类型（activity / service / provider / receiver）分组，每条含 `type` 字段标记 `undefined`（权限未定义）或 `unprivileged`（保护级别不足） |
 
 ```json
 # all_comp.json
@@ -165,8 +165,9 @@ JVM 默认 `-XX:MaxRAMPercentage=50.0`（分配当前设备内存的 50%），�
   "package": "com.example.app",
   "filename": "packages/com.example.app/base.apk",
   "components": [
-    { "name": "com.example.app.MainActivity", "type": "activity", "permission": "" },
-    { "name": "com.example.app.DataProvider", "type": "provider", "permission": "com.example.app.READ_DATA" }
+    { "name": "com.example.app.MainActivity", "type": "activity", "exported": true, "permission": "" },
+    { "name": "com.example.app.InternalService", "type": "service", "exported": false, "permission": "" },
+    { "name": "com.example.app.DataProvider", "type": "provider", "exported": true, "permission": "com.example.app.READ_DATA" }
   ],
   "defined_permissions": [
     { "name": "com.example.app.READ_DATA", "protectionLevel": "normal" }
@@ -343,8 +344,6 @@ python3 ase_shell/ase_shell.py <dump_dir>
 | `service list <service>` | 显示单个服务信息：descriptor、可访问性、Java/Native AIDL（impl/so、backend、onTransact、展开的方法签名） |
 
 新增命令：在 `ase_shell/ase_shell.py` 中用 `@command(...)` 注册 `handler(ctx, argv)`；命令内通过 `ctx.resolve()` 取路径，确保只访问 ASE 产物。
-
-## 输出文件
 
 ## 输出文件
 

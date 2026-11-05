@@ -6,6 +6,7 @@ import java.util.List;
 public class Component {
     public String name;
     public String type;
+    public Boolean exported;
     public String permission;
     public String readPermission;
     public String writePermission;
