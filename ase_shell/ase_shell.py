@@ -752,7 +752,7 @@ def run_repl(ctx: Context, history_path: Optional[Path]) -> None:
                 break
             except KeyboardInterrupt:
                 print()
-                continue
+                break
             try:
                 dispatch(ctx, line)
             except ExitShell:
