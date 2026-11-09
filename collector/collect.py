@@ -76,7 +76,11 @@ class AdbDevice:
             if sys.stderr.isatty():
                 sys.stderr.write('\n')
                 sys.stderr.flush()
-            logger.warning('adb pull failed: %s (rc=%d)', remote, r.returncode)
+            details = r.stderr.decode('utf-8', errors='replace').strip()
+            if not details:
+                details = r.stdout.decode('utf-8', errors='replace').strip()
+            suffix = f'\n{details}' if details else ''
+            logger.warning('adb pull failed: %s (rc=%d)%s', remote, r.returncode, suffix)
         return r.returncode == 0
 
     def root(self):
