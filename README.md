@@ -27,6 +27,8 @@ Android 固件攻击面分析工具，覆盖「固件采集 → 静态分析 →
 │   └── native_analyzer.py         # Native AIDL 扫描
 ├── post_analyzer/
 │   └── post_analyzer.py           # 后处理：求差集与盲区服务分析
+├── diff_analyzer/
+│   └── diff.py                    # 双 dump 镜像差异（组件 / 服务 / APEX）
 ├── ase_shell/
 │   └── ase_shell.py               # dump 目录交互式检索（gdb 风格）
 └── AttackSurfaceExplorer/         # 设备端 Binder 探测与动态验证框架（详见子目录 README）
@@ -156,8 +158,8 @@ JVM 默认 `-XX:MaxRAMPercentage=50.0`（分配当前设备内存的 50%），�
 
 | 输出 | 说明 |
 |------|------|
-| `all_comp.json` | 全量组件清单（含 `exported` 字段，导出与非导出组件均收录；包名、组件、定义权限、声明权限、protected-broadcast）；APK 路径为相对 workspace root 的相对路径 |
-| `accessible_comp.json` | 问题组件清单（仅针对导出组件），按组件类型（activity / service / provider / receiver）分组，每条含 `type` 字段标记 `undefined`（权限未定义）或 `unprivileged`（保护级别不足） |
+| `all_comp.json` | 全量组件清单（含 `exported`、`enabled` 字段，导出/非导出、启用/禁用组件均收录；包名、组件、定义权限、声明权限、protected-broadcast）；APK 路径为相对 workspace root 的相对路径 |
+| `accessible_comp.json` | 问题组件清单（仅针对已导出且 `enabled != false` 的组件），按组件类型（activity / service / provider / receiver）分组，每条含 `type` 字段标记 `undefined`（权限未定义）或 `unprivileged`（保护级别不足） |
 
 ```json
 # all_comp.json
@@ -324,6 +326,34 @@ cd ../post_analyzer && python3 post_analyzer.py ~/firmware/pixel8
 # 可选：针对盲区服务或高危 AIDL 进行实机动态 PoC 验证
 cd ../AttackSurfaceExplorer && python3 runner.py sample_scripts/TestServiceProbe.java -a "service_name"
 ```
+
+## 镜像差异（diff_analyzer）
+
+比较两个已完成分析的 dump，默认把结果写入新镜像目录 `<candidate>/diff.json`：
+
+```bash
+# 全量差异（组件 + 服务 + APEX）
+python3 diff_analyzer/diff.py <baseline_dump> <candidate_dump>
+
+# 指定输出路径
+python3 diff_analyzer/diff.py <baseline_dump> <candidate_dump> -o report.json
+
+# 某侧产物缺失时仍继续（对应区段标记 unavailable，退出码 0）
+python3 diff_analyzer/diff.py <baseline_dump> <candidate_dump> --ignore-missing
+```
+
+| 区段 | 内容 |
+|------|------|
+| `components` | 包增删、APK sha256、版本号、签名证书、组件增删、`exported` 变化、权限变化、弱权限可达变化（`enabled=false` 不计入）、自定义权限定义变化、intent-filter/actions/categories/data 变化、`uses_permissions` 变化、`protected_broadcasts` 变化、provider `path_permission` 变化 |
+| `permissions` | 平台权限定义（`permissions/permissions.txt`）的新增/删除/`protectionLevel` 变化，以及 `permissions/` 下文件增删 |
+| `services` | 服务注册表增删、可达性 0/1 变化、AIDL 接口增删、`impl`/`so`/`backend` 变化、方法签名增删（`onTransact` 地址不参与比较） |
+| `apex` | APEX 模块增删；模块版本/文件变化只计入统计，不展开明细 |
+
+`enabled="false"` 的组件仍保留在 `all_comp.json`，但不计入 `accessible_comp.json`，diff 也不会把它视为 accessible。`enabled` 属于新增字段，旧缓存会触发重新扫描。
+
+约定：baseline 为参照，candidate 为新镜像；`added` 表示仅新镜像存在。共有包的 uid 变化仅在跨越 10000（系统/应用 UID 分界）或双方均 `< 10000` 时记录，双方均 `>= 10000` 的应用 UID 重分配不计入。默认情况下，任一侧缺少所请求区段所需的产物（如 `all_comp.json`、`service_aidl.txt`、`apex/`）会直接报错退出，避免把“没跑分析”误判为“组件/接口全删”。空文件按缺失处理；APEX 还会用 `apex_index.csv` 校验模块是否真正落盘。只有显式加 `--ignore-missing` 才会继续：对应区段标记 `availability: false`，缺失项记录在 `missing_artifacts`。不对 `system/framework/*.jar` 或 APEX 内 `javalib` 做 sha256。
+
+APK 版本/签名依赖 Android SDK 的 `aapt2` / `apksigner`（按 `ANDROID_HOME`、`ANDROID_SDK_ROOT`、`~/Library/Android/sdk` 等路径自动查找）；缺失时回退到内置 AXML 解析，签名置空并记录 `reason`。
 
 ## 交互式检索（ase_shell，框架）
 

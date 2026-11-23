@@ -47,6 +47,13 @@ public class ManifestParser {
             components.addAll(collectReceivers(application, info.packageName));
             info.components = components;
 
+            // <application android:enabled="false"> disables every component.
+            if ("false".equals(application.getAttribute("android:enabled"))) {
+                for (Component component : components) {
+                    component.enabled = Boolean.FALSE;
+                }
+            }
+
             return info;
         } catch (Exception e) {
             logger.error("Failed to parse manifest", e);
@@ -99,6 +106,7 @@ public class ManifestParser {
             c.type = "activity";
             c.exported = isComponentExported(el);
             c.permission = el.getAttribute("android:permission");
+            applyEnabled(c, el);
             if (isActivityBrowsable(el)) {
                 c.intentFilters = collectIntentFilters(el);
             }
@@ -133,6 +141,11 @@ public class ManifestParser {
             c.type = "activity";
             c.exported = isComponentExported(el);
             c.permission = el.getAttribute("android:permission");
+            applyEnabled(c, el);
+            String targetActivity = el.getAttribute("android:targetActivity");
+            if (targetActivity != null && !targetActivity.isEmpty()) {
+                c.targetActivity = fullyQualifiedName(targetActivity, packageName);
+            }
             if (c.permission == null || c.permission.isEmpty()) {
                 String target = fullyQualifiedName(
                         el.getAttribute("android:targetActivity"), packageName);
@@ -168,6 +181,7 @@ public class ManifestParser {
             c.type = "service";
             c.exported = isComponentExported(el);
             c.permission = el.getAttribute("android:permission");
+            applyEnabled(c, el);
             list.add(c);
         }
         return list;
@@ -186,8 +200,19 @@ public class ManifestParser {
             c.type = "provider";
             c.exported = isComponentExported(el);
             c.permission = el.getAttribute("android:permission");
+            applyEnabled(c, el);
             c.readPermission = el.getAttribute("android:readPermission");
             c.writePermission = el.getAttribute("android:writePermission");
+            c.authorities = new ArrayList<>();
+            String authorities = el.getAttribute("android:authorities");
+            if (authorities != null && !authorities.isEmpty()) {
+                for (String authority : authorities.split(";")) {
+                    String trimmed = authority.trim();
+                    if (!trimmed.isEmpty()) {
+                        c.authorities.add(trimmed);
+                    }
+                }
+            }
             c.pathPermission = new ArrayList<>();
 
             NodeList pathPerms = el.getElementsByTagName("path-permission");
@@ -227,6 +252,7 @@ public class ManifestParser {
             c.type = "receiver";
             c.exported = isComponentExported(el);
             c.permission = el.getAttribute("android:permission");
+            applyEnabled(c, el);
             c.actions = getAllActionNames(el);
             list.add(c);
         }
@@ -245,6 +271,14 @@ public class ManifestParser {
             }
         }
         return actions;
+    }
+
+    /**
+     * Android defaults to enabled. Only a literal android:enabled="false" disables
+     * the component; unresolved resource references keep the default (enabled).
+     */
+    private static void applyEnabled(Component component, Element element) {
+        component.enabled = !"false".equals(element.getAttribute("android:enabled"));
     }
 
     private static boolean isComponentExported(Element component) {

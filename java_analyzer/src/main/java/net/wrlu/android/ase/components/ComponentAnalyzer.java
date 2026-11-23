@@ -42,7 +42,7 @@ public class ComponentAnalyzer {
                 logger.warn("Cached file invalid, re-scan: {}", allCompFile);
                 baseData = scanDir(packagesDir);
             } else if (isLegacyCache(baseData)) {
-                logger.info("Cached file predates the exported flag, re-scan: {}", allCompFile);
+                logger.info("Cached file predates the exported/enabled flags, re-scan: {}", allCompFile);
                 baseData = scanDir(packagesDir);
             }
         } else {
@@ -75,7 +75,7 @@ public class ComponentAnalyzer {
         for (PackageInfo info : baseData) {
             if (info.components == null) continue;
             for (Component component : info.components) {
-                if (component.exported == null) {
+                if (component.exported == null || component.enabled == null) {
                     return true;
                 }
             }
@@ -166,9 +166,12 @@ public class ComponentAnalyzer {
         Map<String, List<Map<String, Object>>> issues = initBuckets();
 
         for (Component component : allComponents) {
-            // all_comp.json now contains every component; only exported ones are reachable
-            // by third-party apps and therefore belong in the issue report.
+            // all_comp.json contains every component (including disabled ones); only an
+            // exported, enabled component is reachable by third-party apps.
             if (Boolean.FALSE.equals(component.exported)) {
+                continue;
+            }
+            if (Boolean.FALSE.equals(component.enabled)) {
                 continue;
             }
             if ("provider".equals(component.type)) {
