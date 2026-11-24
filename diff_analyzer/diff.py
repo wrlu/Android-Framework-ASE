@@ -24,10 +24,10 @@ import hashlib
 import json
 import os
 import re
-import struct
+import shutil
 import subprocess
 import sys
-import zipfile
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -43,9 +43,6 @@ AIDL_FALLBACK_FILES = (
     ('java', 'accessible_service_aidl.txt'),
     ('native', 'accessible_native_aidl.txt'),
 )
-
-RES_VERSION_CODE = 0x0101021B
-RES_VERSION_NAME = 0x0101021C
 
 ARTIFACTS = {
     'comp': ('package_index.csv', 'all_comp.json', 'accessible_comp.json'),
@@ -159,238 +156,6 @@ def section_missing(dump, section):
     return issues
 
 
-def sorted_unique(values):
-    return sorted({v for v in values if v is not None})
-
-
-def dump_label(path):
-    return path.name
-
-
-# --------------------------------------------------------------------------- #
-# APK metadata: version / signature / manifest (AXML)
-# --------------------------------------------------------------------------- #
-
-def _u8(data, pos):
-    """Read an Android UTF-8 string length (1 or 2 bytes)."""
-    value = data[pos]
-    pos += 1
-    if value & 0x80:
-        value = ((value & 0x7F) << 8) | data[pos]
-        pos += 1
-    return value, pos
-
-
-def _string_pool(data, pos):
-    string_count, _style_count, flags, strings_start, _styles_start = struct.unpack_from(
-        '<IIIII', data, pos + 8)
-    utf8 = bool(flags & 0x100)
-    offsets = struct.unpack_from('<%dI' % string_count, data, pos + 28) if string_count else ()
-    base = pos + strings_start
-    strings = []
-    for offset in offsets:
-        cursor = base + offset
-        if utf8:
-            _, cursor = _u8(data, cursor)   # UTF-16 length
-            length, cursor = _u8(data, cursor)
-            strings.append(data[cursor:cursor + length].decode('utf-8', 'replace'))
-        else:
-            length = struct.unpack_from('<H', data, cursor)[0]
-            cursor += 2
-            if length & 0x8000:
-                length = ((length & 0x7FFF) << 16) | struct.unpack_from('<H', data, cursor)[0]
-                cursor += 2
-            strings.append(data[cursor:cursor + length * 2].decode('utf-16-le', 'replace'))
-    return strings
-
-
-def parse_axml_manifest(raw):
-    """Extract manifest attributes from a binary AndroidManifest.xml."""
-    chunk_type, header_size, _size = struct.unpack_from('<HHI', raw, 0)
-    if chunk_type != 0x0003:
-        raise ValueError('not a binary XML document')
-
-    strings, resource_map = [], []
-    pos = header_size
-    while pos + 8 <= len(raw):
-        chunk_type, chunk_header, chunk_size = struct.unpack_from('<HHI', raw, pos)
-        if chunk_size < 8:
-            break
-        if chunk_type == 0x0001:            # string pool
-            strings = _string_pool(raw, pos)
-        elif chunk_type == 0x0180:          # resource map
-            count = (chunk_size - chunk_header) // 4
-            if count:
-                resource_map = list(struct.unpack_from('<%dI' % count, raw, pos + chunk_header))
-        elif chunk_type == 0x0102:          # start element
-            _ns, _name = struct.unpack_from('<II', raw, pos + 16)
-            attr_start, attr_size, attr_count = struct.unpack_from('<HHH', raw, pos + 24)
-            attrs = pos + 16 + attr_start
-            values = {}
-            for index in range(attr_count):
-                base = attrs + index * attr_size
-                _ans, name_idx, raw_idx = struct.unpack_from('<III', raw, base)
-                _tsize, _res0, data_type, data_value = struct.unpack_from('<HBBI', raw, base + 12)
-                key = strings[name_idx] if name_idx < len(strings) else ''
-                resource_id = resource_map[name_idx] if name_idx < len(resource_map) else 0
-
-                value = None
-                if data_type == 0x03:           # string reference
-                    value = strings[data_value] if data_value < len(strings) else None
-                elif data_type in (0x10, 0x11):  # int dec / int hex
-                    value = data_value if data_value < 0x80000000 else data_value - 0x100000000
-                elif data_type == 0x12:         # boolean
-                    value = bool(data_value)
-                elif raw_idx != 0xFFFFFFFF and raw_idx < len(strings):
-                    value = strings[raw_idx]
-
-                if resource_id == RES_VERSION_CODE or key == 'versionCode':
-                    values['versionCode'] = value
-                elif resource_id == RES_VERSION_NAME or key == 'versionName':
-                    values['versionName'] = value
-            return values
-        pos += chunk_size
-    return {}
-
-
-class ApkInspector:
-    """Resolve versionName/versionCode and signer certificate digests."""
-
-    def __init__(self):
-        self.aapt2 = self._find_tool('aapt2')
-        self.apksigner = self._find_tool('apksigner')
-        self.apkanalyzer = self._find_apkanalyzer()
-        self._version_cache = {}
-        self._signature_cache = {}
-
-    @staticmethod
-    def _sdk_roots():
-        roots = []
-        for env in ('ANDROID_HOME', 'ANDROID_SDK_ROOT'):
-            value = os.environ.get(env)
-            if value:
-                roots.append(Path(value))
-        roots.append(Path.home() / 'Library' / 'Android' / 'sdk')
-        roots.append(Path.home() / 'Android' / 'Sdk')
-        return roots
-
-    def _find_tool(self, name):
-        for root in self._sdk_roots():
-            build_tools = root / 'build-tools'
-            if not build_tools.is_dir():
-                continue
-            versions = sorted((p for p in build_tools.iterdir() if p.is_dir()),
-                              key=lambda p: p.name, reverse=True)
-            for version in versions:
-                candidate = version / name
-                if candidate.is_file():
-                    return str(candidate)
-        return None
-
-    def _find_apkanalyzer(self):
-        for root in self._sdk_roots():
-            for candidate in (root / 'cmdline-tools' / 'latest' / 'bin' / 'apkanalyzer',
-                              root / 'tools' / 'bin' / 'apkanalyzer'):
-                if candidate.is_file():
-                    return str(candidate)
-        return None
-
-    def version(self, apk):
-        key = str(apk)
-        if key in self._version_cache:
-            return self._version_cache[key]
-
-        result = {'versionCode': None, 'versionName': None}
-        if self.aapt2:
-            result = self._version_aapt2(apk) or result
-        if result['versionCode'] is None and result['versionName'] is None and self.apkanalyzer:
-            result = self._version_apkanalyzer(apk) or result
-        if result['versionCode'] is None and result['versionName'] is None:
-            result = self._version_axml(apk) or result
-
-        self._version_cache[key] = result
-        return result
-
-    def _version_aapt2(self, apk):
-        try:
-            proc = subprocess.run([self.aapt2, 'dump', 'badging', str(apk)],
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                  text=True, errors='replace', timeout=120)
-        except (OSError, subprocess.SubprocessError):
-            return None
-        if proc.returncode != 0:
-            return None
-        code = re.search(r"versionCode='([^']*)'", proc.stdout)
-        name = re.search(r"versionName='([^']*)'", proc.stdout)
-        if not code and not name:
-            return None
-        return {
-            'versionCode': code.group(1) if code else None,
-            'versionName': name.group(1) if name else None,
-        }
-
-    def _version_apkanalyzer(self, apk):
-        def run(argument):
-            try:
-                proc = subprocess.run([self.apkanalyzer, 'manifest', argument, str(apk)],
-                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                      text=True, errors='replace', timeout=120)
-            except (OSError, subprocess.SubprocessError):
-                return None
-            return proc.stdout.strip() if proc.returncode == 0 else None
-
-        code = run('version-code')
-        name = run('version-name')
-        if code is None and name is None:
-            return None
-        return {'versionCode': code, 'versionName': name}
-
-    @staticmethod
-    def _version_axml(apk):
-        try:
-            with zipfile.ZipFile(apk) as archive:
-                raw = archive.read('AndroidManifest.xml')
-            values = parse_axml_manifest(raw)
-        except (OSError, KeyError, ValueError, zipfile.BadZipFile, struct.error):
-            return None
-        if not values:
-            return None
-        return {
-            'versionCode': values.get('versionCode'),
-            'versionName': values.get('versionName'),
-        }
-
-    def signature(self, apk):
-        key = str(apk)
-        if key in self._signature_cache:
-            return self._signature_cache[key]
-
-        if not self.apksigner:
-            result = {'certificates': None, 'reason': 'apksigner not found'}
-        else:
-            try:
-                proc = subprocess.run([self.apksigner, 'verify', '--print-certs', str(apk)],
-                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                      text=True, errors='replace', timeout=180)
-            except (OSError, subprocess.SubprocessError) as exc:
-                result = {'certificates': None, 'reason': f'apksigner failed: {exc}'}
-            else:
-                certificates = sorted_unique(
-                    item.lower() for item in
-                    re.findall(r'certificate SHA-256 digest:\s*([0-9a-fA-F]+)', proc.stdout))
-                if certificates:
-                    result = {'certificates': certificates, 'reason': None}
-                else:
-                    detail = (proc.stderr or proc.stdout or '').strip().splitlines()
-                    result = {
-                        'certificates': None,
-                        'reason': detail[0] if detail else 'no signer certificate found',
-                    }
-
-        self._signature_cache[key] = result
-        return result
-
-
 # --------------------------------------------------------------------------- #
 # Components section
 # --------------------------------------------------------------------------- #
@@ -437,17 +202,35 @@ def hash_apks(apks, workers):
 
 
 def load_package_index(dump):
-    """package -> {uid, path}."""
+    """Set of package names from package_index.csv."""
+    result = set()
+    for row in load_csv(dump / 'package_index.csv'):
+        name = (row.get('package_name') or '').strip()
+        if name:
+            result.add(name)
+    return result
+
+
+def load_package_uids(dump):
+    """package -> uid from package_index.csv."""
     result = {}
     for row in load_csv(dump / 'package_index.csv'):
         name = (row.get('package_name') or '').strip()
-        if not name:
-            continue
-        result[name] = {
-            'uid': (row.get('uid') or '').strip(),
-            'path': (row.get('path') or '').strip(),
-        }
+        if name:
+            result[name] = (row.get('uid') or '').strip()
     return result
+
+
+def meaningful_uid_change(uid_a, uid_b):
+    """Report a uid change only when it crosses the system/app boundary."""
+    if uid_a == uid_b:
+        return False
+    try:
+        value_a = int(uid_a)
+        value_b = int(uid_b)
+    except (TypeError, ValueError):
+        return True
+    return not (value_a >= 10000 and value_b >= 10000)
 
 
 def load_component_data(dump):
@@ -495,28 +278,6 @@ def load_accessible_components(dump):
     return result
 
 
-def collect_permission_files(dump):
-    base = dump / 'permissions'
-    result = {}
-    if not base.is_dir():
-        return result
-    for path in sorted(base.rglob('*')):
-        relative = path.relative_to(base)
-        if any(part in SKIP_NAMES for part in relative.parts):
-            continue
-        if path.is_file():
-            result[str(relative)] = sha256_file(path)
-    return result
-
-
-def diff_permission_files(dump_a, dump_b):
-    files_a = collect_permission_files(dump_a)
-    files_b = collect_permission_files(dump_b)
-    added = sorted(set(files_b) - set(files_a))
-    removed = sorted(set(files_a) - set(files_b))
-    return {'added': added, 'removed': removed}
-
-
 def load_permission_definitions(dump):
     """Parse permissions/permissions.txt (`pm list permissions -f` style)."""
     path = dump / 'permissions' / 'permissions.txt'
@@ -558,9 +319,7 @@ def diff_permission_definitions(dump_a, dump_b):
     result = {
         'available': not reasons,
         'reasons': reasons,
-        'summary': None,
         'definitions': {'added': [], 'removed': [], 'changed': []},
-        'files': {'added': [], 'removed': [], 'changed': []},
     }
     if reasons:
         return result
@@ -570,25 +329,22 @@ def diff_permission_definitions(dump_a, dump_b):
         item_a = defs_a.get(name)
         item_b = defs_b.get(name)
         if item_b and not item_a:
-            added.append(item_b)
+            added.append(name)
         elif item_a and not item_b:
-            removed.append(item_a)
+            removed.append(name)
         elif (item_a['protectionLevel'] != item_b['protectionLevel']
               or item_a['package'] != item_b['package']):
-            changed.append({
-                'name': name,
-                'package': {'from': item_a['package'], 'to': item_b['package']},
-                'protectionLevel': {'from': item_a['protectionLevel'],
-                                    'to': item_b['protectionLevel']},
-            })
+            entry = {'name': name}
+            if item_a['package'] != item_b['package']:
+                entry['package'] = {'value': item_b['package'], 'old': item_a['package']}
+            if item_a['protectionLevel'] != item_b['protectionLevel']:
+                entry['protectionLevel'] = {
+                    'value': item_b['protectionLevel'],
+                    'old': item_a['protectionLevel'],
+                }
+            changed.append(entry)
 
-    files = diff_permission_files(dump_a, dump_b)
     result['definitions'] = {'added': added, 'removed': removed, 'changed': changed}
-    result['files'] = {'added': files['added'], 'removed': files['removed']}
-    result['summary'] = {
-        'added': len(added), 'removed': len(removed), 'changed': len(changed),
-        'files_added': len(files['added']), 'files_removed': len(files['removed']),
-    }
     return result
 
 
@@ -604,26 +360,6 @@ def diff_apk_files(files_a, hashes_a, files_b, hashes_b):
             'changed': sha_a != sha_b,
         })
     return entries
-
-
-def meaningful_uid_change(uid_a, uid_b):
-    """Report a uid change only when it is security-relevant.
-
-    App uids (>= 10000) are reassigned freely on update/reinstall, so a change
-    between two app uids carries no signal. A change is meaningful when it
-    crosses the system/app boundary (10000) or stays within system uids
-    (< 10000, e.g. a package moving between system/priv-app or OEM uids).
-    """
-    if uid_a == uid_b:
-        return False
-    try:
-        value_a = int(uid_a)
-        value_b = int(uid_b)
-    except (TypeError, ValueError):
-        return True
-    if value_a >= 10000 and value_b >= 10000:
-        return False
-    return True
 
 
 def canonical_filter(intent_filter):
@@ -706,6 +442,7 @@ def diff_components(dump_a, dump_b, workers):
             'availability': {'available': False, 'reasons': reasons},
             'summary': None,
             'packages': {'added': [], 'removed': [], 'changed': []},
+            'uid_changed': [],
             'components': {
                 'added': [], 'removed': [], 'export_changed': [],
                 'permission_changed': [], 'provider_permission_changed': [],
@@ -726,6 +463,8 @@ def diff_components(dump_a, dump_b, workers):
 
     index_a = load_package_index(dump_a)
     index_b = load_package_index(dump_b)
+    uids_a = load_package_uids(dump_a)
+    uids_b = load_package_uids(dump_b)
     comp_a = load_component_data(dump_a)
     comp_b = load_component_data(dump_b)
     acc_a = load_accessible_components(dump_a)
@@ -733,24 +472,20 @@ def diff_components(dump_a, dump_b, workers):
 
     packages = sorted(set(apks_a) | set(apks_b) | set(index_a) | set(index_b)
                       | set(comp_a) | set(comp_b))
-    inspector = ApkInspector()
-
     added, removed, changed = [], [], []
-    pending = []
+    uid_changed = []
     for package in packages:
         in_a = package in apks_a or package in index_a or package in comp_a
         in_b = package in apks_b or package in index_b or package in comp_b
         if in_b and not in_a:
             added.append({
                 'package': package,
-                'uid': index_b.get(package, {}).get('uid'),
                 'apk': diff_apk_files({}, {}, apks_b.get(package, {}), hashes_b.get(package, {})),
             })
             continue
         if in_a and not in_b:
             removed.append({
                 'package': package,
-                'uid': index_a.get(package, {}).get('uid'),
                 'apk': diff_apk_files(apks_a.get(package, {}), hashes_a.get(package, {}), {}, {}),
             })
             continue
@@ -758,61 +493,23 @@ def diff_components(dump_a, dump_b, workers):
         entry = {'package': package}
         dirty = False
 
-        uid_a = index_a.get(package, {}).get('uid')
-        uid_b = index_b.get(package, {}).get('uid')
+        uid_a = uids_a.get(package)
+        uid_b = uids_b.get(package)
         if meaningful_uid_change(uid_a, uid_b):
-            entry['uid'] = {'from': uid_a, 'to': uid_b}
-            dirty = True
+            uid_changed.append({'package': package, 'value': uid_b, 'old': uid_a})
 
         apk_files = diff_apk_files(apks_a.get(package, {}), hashes_a.get(package, {}),
                                    apks_b.get(package, {}), hashes_b.get(package, {}))
         apk_changed = any(item['changed'] for item in apk_files)
         if apk_changed:
+            # Kept only for the runtime skip decision; stripped before output.
             entry['apk'] = {'files': apk_files, 'changed': True}
             dirty = True
-            base_a = apks_a.get(package, {}).get('base.apk') or next(
-                iter(apks_a.get(package, {}).values()), None)
-            base_b = apks_b.get(package, {}).get('base.apk') or next(
-                iter(apks_b.get(package, {}).values()), None)
-            pending.append((entry, base_a, base_b))
 
         if dirty:
             changed.append(entry)
 
-    def inspect_pair(item):
-        entry, base_a, base_b = item
-        version_a = inspector.version(base_a) if base_a else None
-        version_b = inspector.version(base_b) if base_b else None
-        signature_a = inspector.signature(base_a) if base_a else None
-        signature_b = inspector.signature(base_b) if base_b else None
-        return entry, version_a, version_b, signature_a, signature_b
-
-    if pending:
-        # aapt2/apksigner are separate processes; probing them in parallel keeps
-        # large images (hundreds of changed APKs) within a reasonable runtime.
-        with ThreadPoolExecutor(max_workers=min(8, len(pending))) as executor:
-            for entry, version_a, version_b, signature_a, signature_b in executor.map(
-                    inspect_pair, pending):
-                if version_a or version_b:
-                    entry['version'] = {
-                        'from': version_a,
-                        'to': version_b,
-                        'changed': (
-                            (version_a or {}).get('versionCode'),
-                            (version_a or {}).get('versionName'),
-                        ) != (
-                            (version_b or {}).get('versionCode'),
-                            (version_b or {}).get('versionName'),
-                        ),
-                    }
-                if signature_a or signature_b:
-                    entry['signature'] = {
-                        'from': (signature_a or {}).get('certificates'),
-                        'to': (signature_b or {}).get('certificates'),
-                        'changed': (signature_a or {}).get('certificates')
-                        != (signature_b or {}).get('certificates'),
-                        'reason': (signature_b or signature_a or {}).get('reason'),
-                    }
+    uid_changed.sort(key=lambda item: item['package'])
 
     # component level
     components_added, components_removed = [], []
@@ -1021,6 +718,7 @@ def diff_components(dump_a, dump_b, workers):
             },
         },
         'packages': {'added': added, 'removed': removed, 'changed': changed},
+        'uid_changed': uid_changed,
         'components': {
             'added': components_added,
             'removed': components_removed,
@@ -1239,11 +937,6 @@ def diff_services(dump_a, dump_b):
                         'service': name, 'kind': kind, 'descriptor': descriptor, **changes,
                     })
 
-    newly_accessible = sum(1 for item in accessibility_changed
-                           if item['from'] is False and item['to'] is True)
-    newly_blocked = sum(1 for item in accessibility_changed
-                        if item['from'] is True and item['to'] is False)
-
     reasons = []
     for side, dump in (('baseline', dump_a), ('candidate', dump_b)):
         for issue in section_missing(dump, 'service'):
@@ -1255,21 +948,6 @@ def diff_services(dump_a, dump_b):
             'accessibility': accessibility_available,
             'aidl': aidl_available,
             'reasons': reasons,
-        },
-        'summary': {
-            'services': {
-                'baseline': len(set(registry_a) | set(aidl_a)),
-                'candidate': len(set(registry_b) | set(aidl_b)),
-                'added': len(added) if registry_available else None,
-                'removed': len(removed) if registry_available else None,
-                'newly_accessible': newly_accessible if accessibility_available else None,
-                'newly_blocked': newly_blocked if accessibility_available else None,
-            },
-            'interfaces': {
-                'added': len(interfaces_added) if aidl_available else None,
-                'removed': len(interfaces_removed) if aidl_available else None,
-                'changed': len(interfaces_changed) if aidl_available else None,
-            },
         },
         'services': {
             'added': added,
@@ -1387,7 +1065,6 @@ def diff_apex(dump_a, dump_b):
     if reasons:
         return {
             'availability': {'available': False, 'reasons': reasons},
-            'summary': None,
             'apex': {'added': [], 'removed': []},
         }
 
@@ -1395,7 +1072,6 @@ def diff_apex(dump_a, dump_b):
     apex_b = collect_apex(dump_b)
 
     added, removed = [], []
-    changed_count = 0
     for name in sorted(set(apex_a) | set(apex_b)):
         if name in apex_b and name not in apex_a:
             tree, files = apex_tree(apex_b[name])
@@ -1404,8 +1080,6 @@ def diff_apex(dump_a, dump_b):
                 'version': apex_version(apex_b[name] / 'apex_manifest.pb'),
                 'digest': tree,
                 'files': {'added': sorted(files), 'removed': []},
-                'signature': {'certificates': None,
-                              'reason': 'apex container not captured'},
             })
             continue
         if name in apex_a and name not in apex_b:
@@ -1415,30 +1089,525 @@ def diff_apex(dump_a, dump_b):
                 'version': apex_version(apex_a[name] / 'apex_manifest.pb'),
                 'digest': tree,
                 'files': {'added': [], 'removed': sorted(files)},
-                'signature': {'certificates': None,
-                              'reason': 'apex container not captured'},
             })
             continue
 
-        digest_a, _ = apex_tree(apex_a[name])
-        digest_b, _ = apex_tree(apex_b[name])
-        version_a = apex_version(apex_a[name] / 'apex_manifest.pb')
-        version_b = apex_version(apex_b[name] / 'apex_manifest.pb')
-        # Module-level changes are counted but not expanded: version/digest churn
-        # carries no direct security signal.
-        if digest_a != digest_b or version_a != version_b:
-            changed_count += 1
-
     return {
         'availability': {'available': True, 'reasons': []},
-        'summary': {
-            'apex': {
-                'baseline': len(apex_a), 'candidate': len(apex_b),
-                'added': len(added), 'removed': len(removed), 'changed': changed_count,
-            },
-        },
         'apex': {'added': added, 'removed': removed},
     }
+
+
+# --------------------------------------------------------------------------- #
+# Bytecode class diff (component classes / Binder Impl classes)
+# --------------------------------------------------------------------------- #
+
+CLASS_DIFF_ENTRY = 'net.wrlu.android.ase.classdiff.ClassDiffMain'
+CLASS_DIFF_JAR = (Path(__file__).resolve().parent.parent
+                  / 'java_analyzer' / 'build' / 'libs' / 'analyzer-1.0.0-all.jar')
+
+
+def load_component_targets(dump):
+    """(package, type, canonical name) -> {component, filename}."""
+    result = {}
+    data = load_json(dump / 'all_comp.json')
+    if not isinstance(data, list):
+        return result
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        package = entry.get('package')
+        filename = entry.get('filename')
+        for component in entry.get('components') or []:
+            if not isinstance(component, dict):
+                continue
+            name = canonical_component_name(package, component.get('name'))
+            if name:
+                result[(package, component.get('type'), name)] = {
+                    'component': component,
+                    'filename': filename,
+                }
+    return result
+
+
+def load_service_impls(dump):
+    """Java Binder implementation classes from service_aidl.txt."""
+    result = set()
+    for line in read_lines(dump / 'service_aidl.txt'):
+        if not line.strip() or line.startswith(' '):
+            continue
+        for item in re.findall(r'\[([^\]]*)\]', line):
+            value = item.strip()
+            if '=' not in value and '/' not in value and value and value != 'null':
+                result.add(value)
+    return result
+
+
+def diff_bytecode(baseline, candidate, components_result=None):
+    """Compare component classes and Binder Impl classes between two dumps."""
+    result = {
+        'available': False,
+        'error': None,
+        'components': None,
+        'binder_impl': None,
+    }
+    if not (baseline / 'all_comp.json').is_file() or not (candidate / 'all_comp.json').is_file():
+        result['error'] = 'all_comp.json missing'
+        return result
+
+    java = shutil.which('java')
+    if not java:
+        result['error'] = 'java not found'
+        return result
+    if not CLASS_DIFF_JAR.is_file():
+        result['error'] = f'analyzer jar not found: {CLASS_DIFF_JAR}'
+        return result
+
+    baseline_components = load_component_targets(baseline)
+    candidate_components = load_component_targets(candidate)
+    allowed_packages = None
+    if components_result:
+        allowed_packages = set()
+        for status in ('added', 'removed'):
+            for item in components_result['packages'][status]:
+                allowed_packages.add(item['package'])
+        for item in components_result['packages']['changed']:
+            if (item.get('apk') or {}).get('changed'):
+                allowed_packages.add(item['package'])
+    targets = {}
+    for key in sorted(set(baseline_components) | set(candidate_components)):
+        if allowed_packages is not None and key[0] not in allowed_packages:
+            continue
+        package, component_type, name = key
+        in_baseline = key in baseline_components
+        in_candidate = key in candidate_components
+        entry = candidate_components.get(key) or baseline_components[key]
+        component = entry['component']
+        target = component.get('targetActivity')
+        if target:
+            target = target.replace('/', '.')
+        else:
+            target = name.split('/', 1)[-1].replace('$', '.')
+        if not target:
+            continue
+        score = 2 if target.startswith(package + '.') else 0
+        if target not in targets:
+            targets[target] = {
+                'package': package,
+                'type': component_type,
+                'className': target,
+                'apkHint': entry.get('filename') or '',
+                'inBaseline': in_baseline,
+                'inCandidate': in_candidate,
+                'score': score,
+            }
+        else:
+            targets[target]['inBaseline'] = targets[target]['inBaseline'] or in_baseline
+            targets[target]['inCandidate'] = targets[target]['inCandidate'] or in_candidate
+            if score > targets[target]['score']:
+                targets[target].update({
+                    'package': package,
+                    'type': component_type,
+                    'apkHint': entry.get('filename') or '',
+                    'score': score,
+                })
+
+    baseline_impls = load_service_impls(baseline)
+    candidate_impls = load_service_impls(candidate)
+    binder_impl = [
+        {'className': name, 'inBaseline': True, 'inCandidate': True}
+        for name in sorted(baseline_impls | candidate_impls)
+    ]
+
+    request = {
+        'baselineRoot': str(baseline),
+        'candidateRoot': str(candidate),
+        'body': True,
+        'components': [
+            {key: value for key, value in item.items() if key != 'score'}
+            for item in targets.values()
+        ],
+        'binderImpl': binder_impl,
+    }
+
+    xmx = os.environ.get('ASE_CLASS_DIFF_XMX', '4g')
+    with tempfile.TemporaryDirectory(prefix='ase_classdiff_') as tmp:
+        request_path = Path(tmp) / 'request.json'
+        response_path = Path(tmp) / 'response.json'
+        request_path.write_text(json.dumps(request), encoding='utf-8')
+        try:
+            proc = subprocess.run(
+                [java, f'-Xmx{xmx}', '-cp', str(CLASS_DIFF_JAR), CLASS_DIFF_ENTRY,
+                 str(request_path), str(response_path)],
+                capture_output=True, text=True, timeout=900)
+        except (OSError, subprocess.SubprocessError) as exc:
+            result['error'] = f'class diff failed: {exc}'
+            return result
+        if not response_path.is_file():
+            detail = (proc.stderr or '').strip().splitlines()
+            result['error'] = detail[-1] if detail else f'class diff exited {proc.returncode}'
+            return result
+        try:
+            response = json.loads(response_path.read_text(encoding='utf-8'))
+        except (OSError, json.JSONDecodeError) as exc:
+            result['error'] = f'invalid class diff output: {exc}'
+            return result
+
+    response.setdefault('available', True)
+    return response
+
+
+def component_class_name(name):
+    return name.split('/', 1)[-1].replace('$', '.')
+
+
+def bytecode_class_maps(bytecode, section):
+    maps = {'added': {}, 'removed': {}, 'changed': {}, 'unresolved': {}}
+    section_data = (bytecode or {}).get(section) or {}
+    for status in maps:
+        for item in section_data.get(status) or []:
+            key = (item.get('class') or '').replace('$', '.')
+            if key:
+                maps[status][key] = item
+    return maps
+
+
+def class_status(className, maps):
+    if not className:
+        return None
+    key = className.replace('$', '.')
+    item = maps['changed'].get(key)
+    if item:
+        return {
+            'status': 'changed',
+            'body_changed': item.get('body_changed'),
+            'baseline': item.get('baseline'),
+            'candidate': item.get('candidate'),
+        }
+    item = maps['added'].get(key)
+    if item:
+        return {'status': 'added', 'container': item.get('container')}
+    item = maps['removed'].get(key)
+    if item:
+        return {'status': 'removed', 'container': item.get('container')}
+    item = maps['unresolved'].get(key)
+    if item:
+        return {'status': 'unresolved', 'reason': item.get('reason')}
+    return None
+
+
+def component_keys_by_class(baseline, candidate):
+    result = {}
+    for dump in (baseline, candidate):
+        for key in load_component_targets(dump):
+            result.setdefault(component_class_name(key[2]), set()).add(key)
+    return result
+
+
+def merge_components(old, bytecode, baseline, candidate):
+    maps = bytecode_class_maps(bytecode, 'components')
+    result = {
+        'availability': old['availability'],
+        'summary': dict(old['summary']) if old.get('summary') else None,
+        'added': [],
+        'removed': [],
+        'changed': [],
+        'packages': old['packages'],
+        'uid_changed': list(old.get('uid_changed') or []),
+        'permissions': old['permissions'],
+        'uses_permissions': old['uses_permissions'],
+        'protected_broadcasts': old['protected_broadcasts'],
+        'unresolved_classes': list(((bytecode or {}).get('components') or {}).get('unresolved') or []),
+    }
+
+    accessibility = {item['name']: {'from': item['from'], 'to': item['to']}
+                     for item in old['components']['accessibility_changed']}
+    excluded = set()
+    for status in ('added', 'removed'):
+        for item in old['components'][status]:
+            entry = {key: item.get(key) for key in
+                     ('package', 'type', 'name', 'exported', 'permission')}
+            if item['name'] in accessibility:
+                entry['accessibility'] = accessibility[item['name']]
+            className = component_class_name(item['name'])
+            info = {'status': status}
+            own = maps[status].get(className)
+            if own and own.get('container'):
+                info['container'] = own['container']
+            changed_class = maps['changed'].get(className)
+            if changed_class:
+                info.update({
+                    'body_changed': changed_class.get('body_changed'),
+                    'baseline': changed_class.get('baseline'),
+                    'candidate': changed_class.get('candidate'),
+                })
+            unresolved_class = maps['unresolved'].get(className)
+            if unresolved_class:
+                info['reason'] = unresolved_class.get('reason')
+            entry['class'] = info
+            result[status].append(entry)
+            excluded.add((item.get('package'), item.get('type'), item.get('name')))
+
+    changed = {}
+
+    def changed_entry(package, component_type, name):
+        key = (package, component_type, name)
+        if key not in changed:
+            changed[key] = {'package': package, 'type': component_type, 'name': name}
+        return changed[key]
+
+    for item in old['components']['export_changed']:
+        changed_entry(item['package'], item['type'], item['name'])['exported'] = {
+            'from': item['from'], 'to': item['to']}
+    for item in old['components']['permission_changed']:
+        changed_entry(item['package'], item['type'], item['name'])['permission'] = {
+            'from': item['from'], 'to': item['to']}
+    for item in old['components']['provider_permission_changed']:
+        changed_entry(item['package'], 'provider', item['name'])['provider_permissions'] = {
+            'read': item['read'], 'write': item['write']}
+    for item in old['components']['path_permission_changed']:
+        changed_entry(item['package'], 'provider', item['name'])['path_permission'] = {
+            'added': item['added'], 'removed': item['removed']}
+    for item in old['components']['accessibility_changed']:
+        package = item['name'].split('/', 1)[0]
+        changed_entry(package, item['type'], item['name'])['accessibility'] = {
+            'from': item['from'], 'to': item['to']}
+    for item in old['components']['intent_filter_changed']:
+        payload = {key: value for key, value in item.items()
+                   if key not in ('package', 'type', 'name')}
+        changed_entry(item['package'], item['type'], item['name'])['intent_filters'] = payload
+
+    baseline_keys = set(load_component_targets(baseline))
+    candidate_keys = set(load_component_targets(candidate))
+    common_keys = baseline_keys & candidate_keys
+    keys_by_class = component_keys_by_class(baseline, candidate)
+    for className in maps['changed']:
+        for key in keys_by_class.get(className, ()):
+            if key not in common_keys:
+                continue
+            changed_entry(key[0], key[1], key[2])['class'] = class_status(className, maps)
+
+    result['changed'] = [changed[key] for key in sorted(changed)
+                         if key not in excluded]
+
+    packages = {}
+
+    def package_entry(name):
+        if name not in packages:
+            packages[name] = {'name': name}
+        return packages[name]
+
+    for status in ('added', 'removed', 'changed'):
+        for item in old['packages'][status]:
+            entry = package_entry(item['package'])
+            entry['status'] = status
+
+    for status in ('added', 'removed', 'changed'):
+        for item in result[status]:
+            entry = package_entry(item['package'])
+            component = {key: value for key, value in item.items() if key != 'package'}
+            entry.setdefault(status, []).append(component)
+
+    grouped = {}
+
+    def package_entry(name):
+        if name not in grouped:
+            grouped[name] = {'name': name}
+        return grouped[name]
+
+    def add(package, key, value):
+        package_entry(package).setdefault(key, []).append(value)
+
+    for name in sorted(packages):
+        entry = packages[name]
+        target = package_entry(name)
+        if 'status' in entry:
+            target['status'] = entry['status']
+        for status in ('added', 'removed'):
+            for component in entry.get(status, []):
+                add(name, status, component['name'])
+                accessibility = component.get('accessibility') or {}
+                if status == 'added' and accessibility.get('to') is not None:
+                    add(name, 'newly_accessible', component['name'])
+                if status == 'removed' and accessibility.get('from') is not None:
+                    add(name, 'no_longer_accessible', component['name'])
+        for component in entry.get('changed', []):
+            add(name, 'changed', component['name'])
+            exported = component.get('exported') or {}
+            if exported.get('to') is True:
+                add(name, 'newly_exported', component['name'])
+            if exported.get('to') is False:
+                add(name, 'newly_hidden', component['name'])
+            if 'permission' in component:
+                add(name, 'permission_changed', component['name'])
+            if 'provider_permissions' in component:
+                add(name, 'provider_permission_changed', component['name'])
+            accessibility = component.get('accessibility') or {}
+            if accessibility.get('from') is None and accessibility.get('to') is not None:
+                add(name, 'newly_accessible', component['name'])
+            if accessibility.get('to') is None and accessibility.get('from') is not None:
+                add(name, 'no_longer_accessible', component['name'])
+            if 'intent_filters' in component:
+                add(name, 'intent_filter_changed', component['name'])
+            if 'path_permission' in component:
+                add(name, 'path_permission_changed', component['name'])
+
+    for item in result['uses_permissions']['added']:
+        add(item['package'], 'uses_permissions_added', item['permission'])
+    for item in result['uses_permissions']['removed']:
+        add(item['package'], 'uses_permissions_removed', item['permission'])
+    for item in result['protected_broadcasts']['added']:
+        add(item['package'], 'protected_broadcasts_added', item['action'])
+    for item in result['protected_broadcasts']['removed']:
+        add(item['package'], 'protected_broadcasts_removed', item['action'])
+    for item in result['unresolved_classes']:
+        package = item.get('package')
+        if package:
+            add(package, 'unresolved_classes', item.get('class'))
+
+    array_keys = {
+        'added', 'removed', 'changed', 'newly_exported', 'newly_hidden',
+        'permission_changed', 'provider_permission_changed',
+        'newly_accessible', 'no_longer_accessible',
+        'intent_filter_changed', 'path_permission_changed',
+        'uses_permissions_added', 'uses_permissions_removed',
+        'protected_broadcasts_added', 'protected_broadcasts_removed',
+        'unresolved_classes',
+    }
+    result_packages = []
+    for name in sorted(grouped):
+        entry = grouped[name]
+        # An APK hash change alone is a runtime skip signal, not a finding.
+        if entry.get('status') == 'changed' and set(entry) <= {'name', 'status'}:
+            continue
+        for key in array_keys:
+            if key in entry:
+                entry[key] = sorted(set(entry[key]))
+        result_packages.append(entry)
+
+    added_packages = []
+    removed_packages = []
+    changed_packages = []
+    for entry in result_packages:
+        status = entry.get('status')
+        if status == 'added':
+            added_packages.append(entry['name'])
+        elif status == 'removed':
+            removed_packages.append(entry['name'])
+        else:
+            detail = {'package': entry['name']}
+            for key in ('uses_permissions_added', 'uses_permissions_removed',
+                        'protected_broadcasts_added', 'protected_broadcasts_removed',
+                        'unresolved_classes'):
+                if key in entry:
+                    detail[key] = entry[key]
+            component_keys = array_keys - {
+                'uses_permissions_added', 'uses_permissions_removed',
+                'protected_broadcasts_added', 'protected_broadcasts_removed',
+                'unresolved_classes'}
+            detail['components'] = {
+                key: value for key, value in entry.items() if key in component_keys}
+            changed_packages.append(detail)
+
+    return {
+        'availability': result['availability'],
+        'added': sorted(added_packages),
+        'removed': sorted(removed_packages),
+        'uid_changed': result['uid_changed'],
+        'changed': sorted(changed_packages, key=lambda x: x['package']),
+    }
+
+
+def merge_services(old, bytecode, baseline, candidate):
+    maps = bytecode_class_maps(bytecode, 'binder_impl')
+    aidl_a, _ = load_aidl(baseline)
+    aidl_b, _ = load_aidl(candidate)
+
+    def block_of(aidl, service, kind, descriptor):
+        return aidl.get(service, {}).get((kind, descriptor)) or {}
+
+    def methods_of(aidl, service, kind, descriptor):
+        return list(block_of(aidl, service, kind, descriptor).get('methods') or [])
+
+    def impl_status(impl):
+        info = class_status(impl, maps)
+        if not info:
+            return 'unchanged'
+        status = info.get('status') or 'unchanged'
+        return 'body_changed' if status == 'changed' else status
+
+    def entry(service, kind, descriptor, impl, old=None, added=None, removed=None):
+        item = {'name': service, 'type': kind, 'descriptor': descriptor}
+        if impl:
+            impl_obj = {'name': impl}
+            if old and old != impl:
+                impl_obj['old'] = old
+            impl_obj['status'] = impl_status(impl)
+            item['impl'] = impl_obj
+        if added:
+            item['methods_added'] = added
+        if removed:
+            item['methods_removed'] = removed
+        return item
+
+    result = {
+        'availability': old['availability'],
+        'added': [],
+        'removed': [],
+        'newly_accessible': [],
+        'newly_blocked': [],
+        'unresolved_classes': list(((bytecode or {}).get('binder_impl') or {}).get('unresolved') or []),
+    }
+
+    added_services = {item['name'] for item in old['services']['added']}
+    removed_services = {item['name'] for item in old['services']['removed']}
+    result['added'] = sorted(added_services)
+    result['removed'] = sorted(removed_services)
+    changed_entries = []
+    result['newly_accessible'] = sorted({
+        item['name'] for item in old['services']['accessibility_changed']
+        if item.get('to') is True})
+    result['newly_blocked'] = sorted({
+        item['name'] for item in old['services']['accessibility_changed']
+        if item.get('to') is False})
+
+    for item in old['interfaces']['added']:
+        if item['service'] in added_services:
+            continue
+        name, kind, descriptor = item['service'], item['kind'], item['descriptor']
+        block = block_of(aidl_b, name, kind, descriptor)
+        changed_entries.append(entry(
+            name, kind, descriptor, block.get('impl') or item.get('impl'),
+            added=methods_of(aidl_b, name, kind, descriptor)))
+    for item in old['interfaces']['removed']:
+        if item['service'] in removed_services:
+            continue
+        name, kind, descriptor = item['service'], item['kind'], item['descriptor']
+        block = block_of(aidl_a, name, kind, descriptor)
+        changed_entries.append(entry(
+            name, kind, descriptor, block.get('impl') or item.get('impl'),
+            removed=methods_of(aidl_a, name, kind, descriptor)))
+    for item in old['interfaces']['changed']:
+        name, kind, descriptor = item['service'], item['kind'], item['descriptor']
+        candidate_impl = block_of(aidl_b, name, kind, descriptor).get('impl')
+        baseline_impl = block_of(aidl_a, name, kind, descriptor).get('impl')
+        if isinstance(item.get('impl'), dict):
+            baseline_impl = item['impl'].get('from') or baseline_impl
+            candidate_impl = item['impl'].get('to') or candidate_impl
+        changed_entry = entry(
+            name, kind, descriptor, candidate_impl, old=baseline_impl,
+            added=item.get('methods_added') or None,
+            removed=item.get('methods_removed') or None)
+        if isinstance(item.get('so'), dict):
+            changed_entry['so'] = {
+                'value': item['so'].get('to'), 'old': item['so'].get('from')}
+        if isinstance(item.get('backend'), dict):
+            changed_entry['backend'] = {
+                'value': item['backend'].get('to'), 'old': item['backend'].get('from')}
+        changed_entries.append(changed_entry)
+
+    result['changed'] = sorted(changed_entries, key=lambda x: (x['name'], x['descriptor']))
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -1480,10 +1649,9 @@ def main(argv=None):
         else candidate / 'diff.json'
 
     report = {
-        'schema_version': 1,
+        'schema_version': 2,
         'generated_at': datetime.now().astimezone().isoformat(timespec='seconds'),
-        'baseline': {'path': str(baseline), 'label': dump_label(baseline)},
-        'candidate': {'path': str(candidate), 'label': dump_label(candidate)},
+        'files': {'baseline': str(baseline), 'candidate': str(candidate)},
     }
 
     missing = []
@@ -1507,9 +1675,13 @@ def main(argv=None):
     if missing:
         report['missing_artifacts'] = missing
 
-    report['components'] = diff_components(baseline, candidate, args.workers)
+    components_result = diff_components(baseline, candidate, args.workers)
+    services_result = diff_services(baseline, candidate)
+    bytecode = diff_bytecode(baseline, candidate, components_result)
+
+    report['packages'] = merge_components(components_result, bytecode, baseline, candidate)
     report['permissions'] = diff_permission_definitions(baseline, candidate)
-    report['services'] = diff_services(baseline, candidate)
+    report['binder'] = merge_services(services_result, bytecode, baseline, candidate)
     report['apex'] = diff_apex(baseline, candidate)
 
     write_json(output, report)
@@ -1518,16 +1690,20 @@ def main(argv=None):
         print(f'ASE image diff')
         print(f'  baseline:  {baseline}')
         print(f'  candidate: {candidate}')
-        if not report['components']['availability']['available']:
+        if not components_result['availability']['available']:
             print('  components: unavailable, skipped (missing artifacts)')
         else:
-            component_summary = report['components']['summary']
+            component_summary = components_result['summary']
             packages = component_summary['packages']
             components = component_summary['components']
+            changed_components = sum(
+                len((package.get('components') or {}).get('changed') or [])
+                for package in report['packages']['changed'])
             print(f"  packages:  {packages['baseline']} -> {packages['candidate']} "
                   f"(+{packages['added']} / -{packages['removed']})")
             print(f"  components:{components['baseline']} -> {components['candidate']} "
                   f"(+{components['added']} / -{components['removed']})")
+            print(f"  changed components: {changed_components}")
             print(f"  newly exported:   {components['newly_exported']}")
             print(f"  newly accessible: {components['newly_accessible']}")
             print(f"  intent filters changed: {components['intent_filter_changed']}")
@@ -1540,37 +1716,44 @@ def main(argv=None):
         if not permissions['available']:
             print('  permissions: unavailable, skipped (missing artifacts)')
         else:
-            permission_summary = permissions['summary']
-            print(f"  permissions: +{permission_summary['added']} "
-                  f"/ -{permission_summary['removed']} "
-                  f"/ ~{permission_summary['changed']}")
+            definitions = permissions['definitions']
+            print(f"  permissions: +{len(definitions['added'])} "
+                  f"/ -{len(definitions['removed'])} "
+                  f"/ ~{len(definitions['changed'])}")
 
-        service_summary = report['services']['summary']
-        availability = report['services']['availability']
-        services = service_summary['services']
+        binder = report['binder']
+        availability = binder['availability']
         if not availability['registry']:
             print('  services: unavailable, skipped (missing artifacts)')
         else:
-            print(f"  services:  {services['baseline']} -> {services['candidate']} "
-                  f"(+{services['added']} / -{services['removed']})")
+            print(f"  services:  +{len(binder['added'])} / -{len(binder['removed'])}")
         if availability['accessibility']:
-            print(f"  newly accessible services: {services['newly_accessible']}")
+            print(f"  newly accessible services: {len(binder['newly_accessible'])} "
+                  f"/ newly blocked: {len(binder['newly_blocked'])}")
         else:
             print('  accessibility: unavailable on one side, skipped')
         if availability['aidl']:
-            interfaces = service_summary['interfaces']
-            print(f"  interfaces: +{interfaces['added']} / -{interfaces['removed']} "
-                  f"/ ~{interfaces['changed']}")
+            print(f"  changed interfaces: {len(binder['changed'])}")
         else:
             print('  AIDL: unavailable on one side, skipped')
 
         if not report['apex']['availability']['available']:
             print('  apex: unavailable, skipped (missing artifacts)')
         else:
-            apex_summary = report['apex']['summary']['apex']
-            print(f"  apex:      {apex_summary['baseline']} -> {apex_summary['candidate']} "
-                  f"(+{apex_summary['added']} / -{apex_summary['removed']} "
-                  f"/ ~{apex_summary['changed']})")
+            apex = report['apex']['apex']
+            print(f"  apex:      +{len(apex['added'])} / -{len(apex['removed'])}")
+
+        if bytecode.get('available'):
+            components = bytecode.get('components') or {}
+            binder_impl = bytecode.get('binder_impl') or {}
+            print(f"  class diff: components {components.get('changed_count', 0)} changed "
+                  f"(+{components.get('added_count', 0)} / -{components.get('removed_count', 0)}) "
+                  f"/ {components.get('resolved', 0)} resolved; "
+                  f"binder impl {binder_impl.get('changed_count', 0)} changed "
+                  f"(+{binder_impl.get('added_count', 0)} / -{binder_impl.get('removed_count', 0)}) "
+                  f"/ {binder_impl.get('resolved', 0)} resolved")
+        else:
+            print(f"  class diff: unavailable ({bytecode.get('error', '')})")
         print(f'  wrote: {output}')
 
     return 0

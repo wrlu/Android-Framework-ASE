@@ -16,6 +16,7 @@ dependencies {
     implementation("com.google.code.gson:gson:2.13.2")
     implementation("org.slf4j:slf4j-simple:2.0.16")
     implementation("org.ow2.asm:asm:9.9")
+    implementation("com.android.tools.smali:smali-dexlib2:3.0.9")
 }
 
 repositories {

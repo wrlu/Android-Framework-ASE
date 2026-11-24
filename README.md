@@ -332,7 +332,7 @@ cd ../AttackSurfaceExplorer && python3 runner.py sample_scripts/TestServiceProbe
 比较两个已完成分析的 dump，默认把结果写入新镜像目录 `<candidate>/diff.json`：
 
 ```bash
-# 全量差异（组件 + 服务 + APEX）
+# 全量差异（组件 + 权限 + 服务 + APEX + 字节码类）
 python3 diff_analyzer/diff.py <baseline_dump> <candidate_dump>
 
 # 指定输出路径
@@ -344,16 +344,75 @@ python3 diff_analyzer/diff.py <baseline_dump> <candidate_dump> --ignore-missing
 
 | 区段 | 内容 |
 |------|------|
-| `components` | 包增删、APK sha256、版本号、签名证书、组件增删、`exported` 变化、权限变化、弱权限可达变化（`enabled=false` 不计入）、自定义权限定义变化、intent-filter/actions/categories/data 变化、`uses_permissions` 变化、`protected_broadcasts` 变化、provider `path_permission` 变化 |
-| `permissions` | 平台权限定义（`permissions/permissions.txt`）的新增/删除/`protectionLevel` 变化，以及 `permissions/` 下文件增删 |
-| `services` | 服务注册表增删、可达性 0/1 变化、AIDL 接口增删、`impl`/`so`/`backend` 变化、方法签名增删（`onTransact` 地址不参与比较） |
+| `packages` | `availability` 标记产物是否可用；`added` / `removed` 只列包名；`uid_changed` 记录跨 10000 边界的 UID 变化（`value`/`old`）；`changed` 条目为 `{package, uses_permissions_*, protected_broadcasts_*, unresolved_classes, components}`，`components` 内按组件变化分类（added/removed/changed、exported、权限、可达性、intent-filter、path-permission），值均为名字数组 |
+| `permissions` | 平台权限定义：`definitions.added` / `removed` 只列权限名；`definitions.changed` 用 `value`/`old`，只列实际变化的字段 |
+| `binder` | `added` / `removed` / `changed`：服务注册表、可达性 0/1、AIDL 接口增删、`impl`/`so`/`backend`、方法签名（`onTransact` 地址不参与比较），以及 impl 类的方法体变化 |
 | `apex` | APEX 模块增删；模块版本/文件变化只计入统计，不展开明细 |
+
+`binder.newly_accessible` / `newly_blocked` 是最终可达性状态集合：包含新增可达、变更可达、移除不可达、变更不可达；不等同于单纯的 `False→True` / `True→False`。
 
 `enabled="false"` 的组件仍保留在 `all_comp.json`，但不计入 `accessible_comp.json`，diff 也不会把它视为 accessible。`enabled` 属于新增字段，旧缓存会触发重新扫描。
 
-约定：baseline 为参照，candidate 为新镜像；`added` 表示仅新镜像存在。共有包的 uid 变化仅在跨越 10000（系统/应用 UID 分界）或双方均 `< 10000` 时记录，双方均 `>= 10000` 的应用 UID 重分配不计入。默认情况下，任一侧缺少所请求区段所需的产物（如 `all_comp.json`、`service_aidl.txt`、`apex/`）会直接报错退出，避免把“没跑分析”误判为“组件/接口全删”。空文件按缺失处理；APEX 还会用 `apex_index.csv` 校验模块是否真正落盘。只有显式加 `--ignore-missing` 才会继续：对应区段标记 `availability: false`，缺失项记录在 `missing_artifacts`。不对 `system/framework/*.jar` 或 APEX 内 `javalib` 做 sha256。
+约定：baseline 为参照，candidate 为新镜像；`added` 表示仅新镜像存在。默认情况下，任一侧缺少所请求区段所需的产物（如 `all_comp.json`、`service_aidl.txt`、`apex/`）会直接报错退出，避免把“没跑分析”误判为“组件/接口全删”。空文件按缺失处理；APEX 还会用 `apex_index.csv` 校验模块是否真正落盘。只有显式加 `--ignore-missing` 才会继续：对应区段标记 `availability: false`，缺失项记录在 `missing_artifacts`。不对 `system/framework/*.jar` 或 APEX 内 `javalib` 做 sha256。
 
-APK 版本/签名依赖 Android SDK 的 `aapt2` / `apksigner`（按 `ANDROID_HOME`、`ANDROID_SDK_ROOT`、`~/Library/Android/sdk` 等路径自动查找）；缺失时回退到内置 AXML 解析，签名置空并记录 `reason`。
+类级差异不再单独输出 `bytecode`，而是并入 `packages` 与 `binder` 的 `added/removed/changed`：
+
+- 组件类按 `all_comp.json` 的声明类（activity-alias 用 `targetActivity`）解析；组件新增/删除时，类状态固定为 `added`/`removed`（即使该类在另一侧已存在），只有两侧都存在的组件才比较方法体指纹（归一化指令）；字段、注解、类继承关系等结构变化不再计入。Binder impl 同理，以 `service_aidl.txt` 的声明为准。
+- Binder impl 类来自 `service_aidl.txt`，并入 `binder` 的接口条目。
+- 内部类 `$`/`.` 自动归一化；只输出变化和无解析结果，未变化的类不展开。
+- 计算由 `java_analyzer` 内置的 dexlib2 helper 完成，默认 `-Xmx4g`，可用 `ASE_CLASS_DIFF_XMX` 调整；jar 未构建时类信息标记为 `unresolved` 或省略，不影响其他字段。
+
+```json
+"packages": {
+  "added": ["com.example.new"],
+  "removed": ["com.example.old"],
+  "uid_changed": [],
+  "changed": [
+    {
+      "package": "com.example",
+      "uses_permissions_added": ["android.permission.CAMERA"],
+      "uses_permissions_removed": [],
+      "protected_broadcasts_added": [],
+      "protected_broadcasts_removed": [],
+      "unresolved_classes": [],
+      "components": {
+        "added": ["com.example/com.example.New"],
+        "removed": [],
+        "changed": ["com.example/com.example.Svc"],
+        "newly_exported": ["com.example/com.example.New"],
+        "newly_hidden": [],
+        "permission_changed": [],
+        "provider_permission_changed": [],
+        "newly_accessible": [],
+        "no_longer_accessible": [],
+        "intent_filter_changed": [],
+        "path_permission_changed": []
+      }
+    }
+  ]
+}
+
+"binder": {
+  "added": ["app_interaction"],
+  "removed": ["selection_toolbar"],
+  "newly_accessible": ["app_interaction"],
+  "newly_blocked": [],
+  "unresolved_classes": [],
+  "changed": [{"name": "activity_task", "type": "java",
+               "descriptor": "android.app.IActivityTaskManager",
+               "impl": {"name": "com.android.server.wm.ActivityTaskManagerService",
+                        "status": "body_changed"},
+               "methods_added": ["..."], "methods_removed": ["..."]}]
+}
+```
+
+纯新增/删除的 Binder 服务只出现在 `added` / `removed` 名字数组，不展开方法；已有服务上的接口增删或方法变化进入 `changed`，并保留 `methods_added` / `methods_removed`。
+
+Native 接口的 `.so` / `backend` 变化会附带 `so` / `backend: {value, old}` 字段。
+
+Binder 接口按接口级扁平输出：`changed` 条目不带 `status`；`type` 为 `java`/`native`；`impl` 为 `{name, status}`，其中 `impl.status` 是真实类检测结果（`body_changed` / `unchanged` / `added` / `removed` / `unresolved`）；impl 类被替换时额外输出 `old`。
+
+APK sha256 只在运行期用于判断包是否变化、跳过未变包的类检测，不写入最终 `diff.json`。
 
 ## 交互式检索（ase_shell，框架）
 
