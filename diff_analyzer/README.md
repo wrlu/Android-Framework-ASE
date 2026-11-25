@@ -209,15 +209,18 @@ apex
 - `newly_accessible` / `newly_blocked`：最终可达性状态集合，包含新增可达、变更可达、移除不可达、变更不可达；不等同于单纯的 `False→True` / `True→False`。
 - `changed`：接口级明细，不再带冗余的 `status` 字段。
 - 已有服务上的接口新增/删除也进入 `changed`，通过 `methods_added` / `methods_removed` 表达；AIDL 签名未变但 `impl` 类方法体发生变化的 Java 接口（纯 `body_changed`）同样进入 `changed`，且不输出 `methods_added` / `methods_removed`。
-- `methods_changed`：Java 接口双侧共有的 AIDL 方法中，自身方法体变化或经 `{impl, enclosing}` 类内/外部类调用链可达变更方法的精确子集（格式与 `methods_added` / `methods_removed` 一致，为空时省略）；与类级 `impl.status = "body_changed"` 构成两层信号。
+- `methods_changed`：Java 接口双侧共有的 AIDL 方法中，自身方法体变化或经 `{impl, enclosing, super}` 调用链可达变更方法的精确子集（格式与 `methods_added` / `methods_removed` 一致，为空时省略）；与类级 `impl.status = "body_changed"` 构成两层信号。
 - `type`：`java` / `native`；native 条目没有 `impl`。
-- `impl.status`：`body_changed` / `unchanged` / `added` / `removed` / `unresolved`；impl 类被替换时额外输出 `old`；若薄壳内部类（如 `$BinderService` / `$Stub`）本身未变但其外部类（enclosing class）方法体发生变化，也会标为 `body_changed` 并额外输出 `enclosing` 指向发生变化的外部类。
-- Native 接口的 `.so` / `backend` 变化：
+- `impl.status`：`body_changed` / `unchanged` / `added` / `removed` / `unresolved`；impl 类被替换时额外输出 `old`；若薄壳内部类（如 `$BinderService` / `$Stub`）本身未变但其外部类变化，输出 `enclosing`；若继承型服务本身未变但自定义父类（最多回溯 2 级，跳过 `Object`/`Binder`/`$Stub`）变化，输出 `super`。
+- Native 接口的 `.so` / `backend` 与 `.so` 二进制哈希变化：
 
 ```json
 "so": {"value": ["system/lib64/libfoo.so"], "old": ["vendor/lib64/libfoo.so"]},
-"backend": {"value": ["ndk"], "old": ["libbinder"]}
+"backend": {"value": ["ndk"], "old": ["libbinder"]},
+"so_changed": ["system/lib64/libfoo.so"]
 ```
+
+  `so_changed` 列出双侧路径相同但二进制 SHA256 发生变化的 `.so`（即使 AIDL 签名与路径未变，纯 `.so` 内容变化的 Native 接口也会进入 `binder.changed`）。
 
 - `onTransact` 地址不参与比较；方法名中的地址前缀会被归一化。
 - `binder.summary` 已移除。

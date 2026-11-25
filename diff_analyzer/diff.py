@@ -1283,6 +1283,7 @@ def class_status(className, maps):
             'body_changed': item.get('body_changed'),
             'entrypoint_changed': bool(item.get('entrypoint_changed')),
             'enclosing': item.get('enclosing'),
+            'super': item.get('super'),
             'changed_methods': item.get('changed_methods') or [],
             'baseline': item.get('baseline'),
             'candidate': item.get('candidate'),
@@ -1606,18 +1607,19 @@ def merge_services(old, bytecode, baseline, candidate):
     def impl_info(impl):
         info = class_status(impl, maps)
         if not info:
-            return 'unchanged', None, []
+            return 'unchanged', None, None, []
         status = info.get('status') or 'unchanged'
         return (
             'body_changed' if status == 'changed' else status,
             info.get('enclosing'),
+            info.get('super'),
             info.get('changed_methods') or [],
         )
 
     def matched_changed_methods(service, kind, descriptor, impl):
         if kind != 'java' or not impl:
             return []
-        status, _enclosing, dex_methods = impl_info(impl)
+        status, _enclosing, _super, dex_methods = impl_info(impl)
         if status != 'body_changed' or not dex_methods:
             return []
         dex_norm = {norm for key in dex_methods
@@ -1628,16 +1630,45 @@ def merge_services(old, bytecode, baseline, candidate):
                         & set(methods_of(aidl_b, service, kind, descriptor)))
         return [sig for sig in common if aidl_sig_to_norm(sig) in dex_norm]
 
-    def entry(service, kind, descriptor, impl, old=None, added=None, removed=None, changed=None):
+    so_hash_cache = {}
+
+    def so_hash(dump_root, rel_path):
+        cache_key = (dump_root, rel_path)
+        if cache_key not in so_hash_cache:
+            target = dump_root / rel_path
+            if target.is_file():
+                try:
+                    so_hash_cache[cache_key] = sha256_file(target)
+                except OSError:
+                    so_hash_cache[cache_key] = None
+            else:
+                so_hash_cache[cache_key] = None
+        return so_hash_cache[cache_key]
+
+    def changed_native_sos(service, descriptor):
+        sos_a = set(block_of(aidl_a, service, 'native', descriptor).get('so') or [])
+        sos_b = set(block_of(aidl_b, service, 'native', descriptor).get('so') or [])
+        changed = []
+        for rel_path in sorted(sos_a & sos_b):
+            ha = so_hash(baseline, rel_path)
+            hb = so_hash(candidate, rel_path)
+            if ha and hb and ha != hb:
+                changed.append(rel_path)
+        return changed
+
+    def entry(service, kind, descriptor, impl, old=None, added=None, removed=None,
+              changed=None, so_changed=None):
         item = {'name': service, 'type': kind, 'descriptor': descriptor}
         if impl:
-            status, enclosing, _dex_methods = impl_info(impl)
+            status, enclosing, super_cls, _dex_methods = impl_info(impl)
             impl_obj = {'name': impl}
             if old and old != impl:
                 impl_obj['old'] = old
             impl_obj['status'] = status
             if enclosing:
                 impl_obj['enclosing'] = enclosing
+            if super_cls:
+                impl_obj['super'] = super_cls
             item['impl'] = impl_obj
         if added:
             item['methods_added'] = added
@@ -1645,6 +1676,8 @@ def merge_services(old, bytecode, baseline, candidate):
             item['methods_removed'] = removed
         if changed:
             item['methods_changed'] = changed
+        if so_changed:
+            item['so_changed'] = so_changed
         return item
 
     result = {
@@ -1698,7 +1731,8 @@ def merge_services(old, bytecode, baseline, candidate):
             name, kind, descriptor, candidate_impl, old=baseline_impl,
             added=item.get('methods_added') or None,
             removed=item.get('methods_removed') or None,
-            changed=matched_changed_methods(name, kind, descriptor, candidate_impl) or None)
+            changed=matched_changed_methods(name, kind, descriptor, candidate_impl) or None,
+            so_changed=changed_native_sos(name, descriptor) if kind == 'native' else None)
         if isinstance(item.get('so'), dict):
             changed_entry['so'] = {
                 'value': item['so'].get('to'), 'old': item['so'].get('from')}
@@ -1716,14 +1750,21 @@ def merge_services(old, bytecode, baseline, candidate):
             blocks_b = aidl_b[name]
             for key in sorted(set(blocks_a) & set(blocks_b)):
                 kind, descriptor = key
-                if kind != 'java' or (name, kind, descriptor) in seen_interfaces:
+                if (name, kind, descriptor) in seen_interfaces:
                     continue
-                impl = blocks_b[key].get('impl')
-                if impl and impl_info(impl)[0] == 'body_changed':
-                    changed_entries.append(entry(
-                        name, kind, descriptor, impl,
-                        changed=matched_changed_methods(name, kind, descriptor, impl) or None))
-                    seen_interfaces.add((name, kind, descriptor))
+                if kind == 'java':
+                    impl = blocks_b[key].get('impl')
+                    if impl and impl_info(impl)[0] == 'body_changed':
+                        changed_entries.append(entry(
+                            name, kind, descriptor, impl,
+                            changed=matched_changed_methods(name, kind, descriptor, impl) or None))
+                        seen_interfaces.add((name, kind, descriptor))
+                elif kind == 'native':
+                    native_sos = changed_native_sos(name, descriptor)
+                    if native_sos:
+                        changed_entries.append(entry(
+                            name, kind, descriptor, None, so_changed=native_sos))
+                        seen_interfaces.add((name, kind, descriptor))
 
     result['changed'] = sorted(changed_entries, key=lambda x: (x['name'], x['descriptor']))
     return result

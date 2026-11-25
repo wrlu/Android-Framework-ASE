@@ -188,6 +188,7 @@ python3 AttackSurfaceExplorer/runner.py \
 
 ## 文档
 
+- [系统架构设计](ARCHITECTURE.md)
 - [collector](collector/README.md)
 - [java_analyzer](java_analyzer/README.md)
 - [native_analyzer](native_analyzer/README.md)

@@ -36,11 +36,11 @@ python3 post_analyzer.py <workspace_dir> [-o <output_file>]
 
 | 输出 | 说明 |
 |------|------|
-| `unresolved_accessible_services.txt` | 实机可达但未匹配到 Java/Native AIDL 实现的服务列表，包含服务名、Descriptor 及原因（`no_aidl_matched` 或 `empty_descriptor`） |
+| `unresolved_accessible_services.txt` | 实机可达但未匹配到 Java/Native AIDL 实现的服务列表，包含服务名、Descriptor、原因（`no_aidl_matched` 或 `empty_descriptor`），以及反向定位到的候选 ELF/APK 路径（`[candidates=...]`，命中时输出） |
 
 ```text
 # unresolved_accessible_services.txt
-media.camera [android.hardware.ICameraService] [no_aidl_matched]
+media.camera [android.hardware.ICameraService] [no_aidl_matched] [candidates=system/lib64/libcameraservice.so]
 vendor.custom.daemon [] [empty_descriptor]
 ```
 

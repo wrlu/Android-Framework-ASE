@@ -215,8 +215,35 @@ public final class ClassDiffMain {
                     }
                 }
             }
+            List<Fingerprint[]> superPairs = new ArrayList<>();
+            String curSuperA = a.superClass;
+            String curSuperB = b.superClass;
+            String curContainerA = a.container;
+            String curContainerB = b.container;
+            for (int depth = 0; depth < 2 && isTrackableBinderSuper(curSuperB); depth++) {
+                String superNameB = rawClassNameFromDescriptor(curSuperB);
+                String superNameA = isTrackableBinderSuper(curSuperA)
+                        ? rawClassNameFromDescriptor(curSuperA) : superNameB;
+                Fingerprint sa = baseline.resolveBinderSuper(superNameA, curContainerA);
+                Fingerprint sb = candidate.resolveBinderSuper(superNameB, curContainerB);
+                if (sa == null || sb == null) {
+                    break;
+                }
+                superPairs.add(new Fingerprint[]{sa, sb});
+                if (entry == null) {
+                    ChangedEntry superEntry = compare(className, null, null, sa, sb);
+                    if (superEntry != null) {
+                        superEntry.superClass = superNameB;
+                        entry = superEntry;
+                    }
+                }
+                curSuperA = sa.superClass;
+                curSuperB = sb.superClass;
+                curContainerA = sa.container;
+                curContainerB = sb.container;
+            }
             if (entry != null) {
-                List<String> affected = affectedBinderMethods(a, b, enclosingPairs);
+                List<String> affected = affectedBinderMethods(a, b, enclosingPairs, superPairs);
                 if (!affected.isEmpty()) {
                     entry.changedMethods = affected;
                 }
@@ -450,6 +477,25 @@ public final class ClassDiffMain {
         return sha256(sb.toString());
     }
 
+    private static boolean isTrackableBinderSuper(String desc) {
+        if (desc == null || !desc.startsWith("L") || !desc.endsWith(";")) {
+            return false;
+        }
+        if (desc.equals("Ljava/lang/Object;") || desc.equals("Landroid/os/Binder;")
+                || desc.endsWith("$Stub;") || isStdLibClass(desc)) {
+            return false;
+        }
+        return true;
+    }
+
+    private static String rawClassNameFromDescriptor(String desc) {
+        String value = desc;
+        if (value.startsWith("L") && value.endsWith(";")) {
+            value = value.substring(1, value.length() - 1);
+        }
+        return value.replace('/', '.');
+    }
+
     private static Map<String, Set<String>> computeCallEdges(ClassDef classDef) {
         String selfDesc = classDef.getType();
         if (selfDesc == null) {
@@ -457,6 +503,9 @@ public final class ClassDiffMain {
         }
         Set<String> trackedDescriptors = new HashSet<>();
         trackedDescriptors.add(selfDesc);
+        if (isTrackableBinderSuper(classDef.getSuperclass())) {
+            trackedDescriptors.add(classDef.getSuperclass());
+        }
         if (selfDesc.startsWith("L") && selfDesc.endsWith(";") && selfDesc.indexOf('$') > 0) {
             String internal = selfDesc.substring(1, selfDesc.length() - 1);
             int idx = internal.lastIndexOf('$');
@@ -500,10 +549,14 @@ public final class ClassDiffMain {
     }
 
     private static List<String> affectedBinderMethods(Fingerprint implA, Fingerprint implB,
-                                                      List<Fingerprint[]> enclosingPairs) {
+                                                      List<Fingerprint[]> enclosingPairs,
+                                                      List<Fingerprint[]> superPairs) {
         Set<String> changedNodes = new HashSet<>();
         collectChangedNodes(implA, implB, changedNodes);
         for (Fingerprint[] pair : enclosingPairs) {
+            collectChangedNodes(pair[0], pair[1], changedNodes);
+        }
+        for (Fingerprint[] pair : superPairs) {
             collectChangedNodes(pair[0], pair[1], changedNodes);
         }
         if (changedNodes.isEmpty()) {
@@ -513,8 +566,13 @@ public final class ClassDiffMain {
         for (Fingerprint[] pair : enclosingPairs) {
             graph.putAll(pair[1].callEdges);
         }
-        List<String> affected = new ArrayList<>();
+        for (Fingerprint[] pair : superPairs) {
+            graph.putAll(pair[1].callEdges);
+        }
+        Set<String> affected = new HashSet<>();
+        Set<String> definedInChild = new HashSet<>();
         for (String mKey : implB.methodHashes.keySet()) {
+            definedInChild.add(mKey);
             if (mKey.startsWith("<init>(") || mKey.startsWith("<clinit>(")) {
                 continue;
             }
@@ -523,8 +581,23 @@ public final class ClassDiffMain {
                 affected.add(mKey);
             }
         }
-        Collections.sort(affected);
-        return affected;
+        for (Fingerprint[] pair : superPairs) {
+            Fingerprint sb = pair[1];
+            for (String mKey : sb.methodHashes.keySet()) {
+                if (definedInChild.contains(mKey)
+                        || mKey.startsWith("<init>(") || mKey.startsWith("<clinit>(")) {
+                    continue;
+                }
+                definedInChild.add(mKey);
+                String start = sb.descriptor + "->" + mKey;
+                if (reachesChanged(start, changedNodes, graph)) {
+                    affected.add(mKey);
+                }
+            }
+        }
+        List<String> sorted = new ArrayList<>(affected);
+        Collections.sort(sorted);
+        return sorted;
     }
 
     private static void collectChangedNodes(Fingerprint a, Fingerprint b, Set<String> out) {
@@ -895,17 +968,19 @@ public final class ClassDiffMain {
         final String bodyHash;
         final String container;
         final String descriptor;
+        final String superClass;
         final List<String> referencedEnclosing;
         final Map<String, String> methodHashes;
         final Map<String, Set<String>> callEdges;
 
-        Fingerprint(String bodyHash, String container, String descriptor,
+        Fingerprint(String bodyHash, String container, String descriptor, String superClass,
                     List<String> referencedEnclosing,
                     Map<String, String> methodHashes,
                     Map<String, Set<String>> callEdges) {
             this.bodyHash = bodyHash;
             this.container = container;
             this.descriptor = descriptor;
+            this.superClass = superClass;
             this.referencedEnclosing = referencedEnclosing;
             this.methodHashes = methodHashes;
             this.callEdges = callEdges;
@@ -985,6 +1060,28 @@ public final class ClassDiffMain {
             return resolveByClassPackage(className, key);
         }
 
+        Fingerprint resolveBinderSuper(String className, String childContainer) {
+            String key = classKeyFromClassName(className);
+            Fingerprint existing = fingerprints.get(key);
+            if (existing != null) return existing;
+            wanted.add(key);
+            if (childContainer != null) {
+                int bang = childContainer.indexOf('!');
+                String containerRel = bang >= 0 ? childContainer.substring(0, bang) : childContainer;
+                if (!containerRel.isEmpty()) {
+                    indexContainerForKey(root.resolve(containerRel), key);
+                    existing = fingerprints.get(key);
+                    if (existing != null) return existing;
+                }
+            }
+            for (Path loadedFile : new ArrayList<>(loaded)) {
+                indexContainerForKey(loadedFile, key);
+                existing = fingerprints.get(key);
+                if (existing != null) return existing;
+            }
+            return resolveByClassPackage(className, key);
+        }
+
         private Fingerprint resolveByClassPackage(String className, String key) {
             String[] parts = className.split("\\.");
             for (int count = parts.length - 1; count >= 2; count--) {
@@ -1051,6 +1148,7 @@ public final class ClassDiffMain {
                         Map<String, Set<String>> callEdges = body ? computeCallEdges(classDef) : Map.of();
                         fingerprints.put(type, new Fingerprint(bodyHash,
                                 relative + "!" + entryName, classDef.getType(),
+                                classDef.getSuperclass(),
                                 refEnclosing, methodHashes, callEdges));
                     }
                 }
@@ -1084,6 +1182,7 @@ public final class ClassDiffMain {
                         Map<String, Set<String>> callEdges = body ? computeCallEdges(classDef) : Map.of();
                         fingerprints.put(type, new Fingerprint(bodyHash,
                                 relative + "!" + entryName, classDef.getType(),
+                                classDef.getSuperclass(),
                                 refEnclosing, methodHashes, callEdges));
                         return;
                     }
@@ -1186,6 +1285,8 @@ public final class ClassDiffMain {
         @SerializedName("entrypoint_changed")
         Boolean entrypointChanged;
         String enclosing;
+        @SerializedName("super")
+        String superClass;
         @SerializedName("changed_methods")
         List<String> changedMethods;
         String baseline;

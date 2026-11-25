@@ -560,28 +560,12 @@ def demangle_symbols(symbols):
     return {s: s for s in symbols}
 
 
-def extract_cpp_methods(desc, short_name, relevant_sos, so_symbols):
-    """Extract C++ method signatures with addresses from ELF dynamic symbols (Scheme 1).
-
-    Returns:
-        list of str: formatted method lines, e.g. '0x8e00: class::method(args)'
-    """
-    bp_str = 'Bp' + short_name
-    default_str = 'I' + short_name + 'Default'
-
-    candidates = {}
-    for rel_so in relevant_sos:
-        symbols = so_symbols.get(rel_so, {})
-        for sym, addr in symbols.items():
-            if bp_str in sym or default_str in sym:
-                candidates.setdefault(sym, addr)
-
+def _collect_cpp_methods_from_candidates(candidates, class_prefixes, skip_names):
     if not candidates:
         return []
-
     demangled_map = demangle_symbols(list(candidates.keys()))
-
-    method_pattern = re.compile(rf'(?:Bp{short_name}|I{short_name}Default)::(\w+)\((.*)\)')
+    prefix_alt = '|'.join(re.escape(p) for p in class_prefixes)
+    method_pattern = re.compile(rf'(?:{prefix_alt})::(\w+)\((.*)\)')
     collected = []
     seen = set()
 
@@ -593,17 +577,20 @@ def extract_cpp_methods(desc, short_name, relevant_sos, so_symbols):
         if not m:
             continue
         name, args = m.group(1), m.group(2)
-        if name in (f'Bp{short_name}', f'I{short_name}Default', 'asBinder', 'createBinder',
-                    'fromBinder', 'getInterfaceVersion', 'getInterfaceHash',
-                    'getInterfaceDescriptor', 'isRemote', 'onTransact', 'dump'):
-            continue
-        if name.startswith('operator'):
+        if name in skip_names or name.startswith('operator'):
             continue
 
         # Clean C++ standard library types for readability
-        demangled_clean = demangled.replace('std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>', 'std::string')
+        demangled_clean = demangled.replace(
+            'std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>',
+            'std::string'
+        )
         demangled_clean = demangled_clean.replace('std::__1::', 'std::')
-        demangled_clean = re.sub(r'std::vector<([^,]+),\s*std::allocator<[^>]+>\s*>', r'std::vector<\1>', demangled_clean)
+        demangled_clean = re.sub(
+            r'std::vector<([^,]+),\s*std::allocator<[^>]+>\s*>',
+            r'std::vector<\1>',
+            demangled_clean
+        )
 
         sig_key = f'{name}({args})'
         if sig_key not in seen:
@@ -612,6 +599,44 @@ def extract_cpp_methods(desc, short_name, relevant_sos, so_symbols):
 
     collected.sort(key=lambda x: x[0])
     return [f'0x{addr:x}: {sig}' for addr, sig in collected]
+
+
+def extract_cpp_methods(desc, short_name, relevant_sos, so_symbols):
+    """Extract C++ method signatures with addresses from ELF dynamic symbols (Scheme 1).
+
+    Prefers Bp{short_name} / I{short_name}Default client proxy symbols; falls back to
+    Bn{short_name} server symbols when client proxy symbols are stripped.
+
+    Returns:
+        list of str: formatted method lines, e.g. '0x8e00: class::method(args)'
+    """
+    bp_str = 'Bp' + short_name
+    default_str = 'I' + short_name + 'Default'
+    bn_str = 'Bn' + short_name
+
+    skip_names = {
+        bp_str, default_str, bn_str, 'asBinder', 'createBinder',
+        'fromBinder', 'getInterfaceVersion', 'getInterfaceHash',
+        'getInterfaceDescriptor', 'isRemote', 'onTransact', 'dump',
+        'createFromParcel', 'writeToParcel',
+    }
+
+    bp_candidates = {}
+    bn_candidates = {}
+    for rel_so in relevant_sos:
+        symbols = so_symbols.get(rel_so, {})
+        for sym, addr in symbols.items():
+            if bp_str in sym or default_str in sym:
+                bp_candidates.setdefault(sym, addr)
+            elif bn_str in sym:
+                bn_candidates.setdefault(sym, addr)
+
+    methods = _collect_cpp_methods_from_candidates(
+        bp_candidates, (bp_str, default_str), skip_names)
+    if methods:
+        return methods
+    return _collect_cpp_methods_from_candidates(
+        bn_candidates, (bn_str,), skip_names)
 
 
 def locate_on_transact(desc, short_name, server_sos, so_symbols):

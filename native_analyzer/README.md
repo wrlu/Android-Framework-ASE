@@ -46,7 +46,7 @@ python3 native_analyzer.py <workspace_dir> [--ignore-registered]
 
 6. **AIDL 方法签名还原**
    - 自动交叉引用 Java 提取的 `service_aidl.txt`；
-   - 对纯 Native 接口，解析 ELF 动态符号表中 `Bp{Name}` 客户端代理类导出符号，还原具体 AIDL 业务方法。
+   - 对纯 Native 接口，优先解析 ELF 动态符号表中 `Bp{Name}` / `I{Name}Default` 客户端代理类导出符号还原 AIDL 业务方法；当客户端符号被裁减时，自动回退解析 `Bn{Name}` 服务端导出符号。
 
 7. **onTransact 入口定位**
    - 匹配服务端 `Bn{Name}::onTransact`（C++）或 `on_transact`（Rust）函数虚地址偏移，输出 `[onTransact=0x...]`。
