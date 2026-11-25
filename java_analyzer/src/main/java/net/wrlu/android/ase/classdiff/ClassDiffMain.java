@@ -34,9 +34,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.security.MessageDigest;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -140,6 +143,7 @@ public final class ClassDiffMain {
             }
             response.components.resolved++;
             ChangedEntry entry = compare(target.className, target.packageName, target.type, a, b);
+            List<Fingerprint[]> enclosingPairs = new ArrayList<>();
             if (entry == null) {
                 List<String> enclosingCandidates = !b.referencedEnclosing.isEmpty()
                         ? b.referencedEnclosing : a.referencedEnclosing;
@@ -147,6 +151,7 @@ public final class ClassDiffMain {
                     Fingerprint ea = baseline.resolveEnclosing(enclosing, target, a.container);
                     Fingerprint eb = candidate.resolveEnclosing(enclosing, target, b.container);
                     if (ea != null && eb != null) {
+                        enclosingPairs.add(new Fingerprint[]{ea, eb});
                         ChangedEntry enclosingEntry = compare(
                                 target.className, target.packageName, target.type, ea, eb);
                         if (enclosingEntry != null) {
@@ -158,6 +163,8 @@ public final class ClassDiffMain {
                 }
             }
             if (entry != null) {
+                entry.entrypointChanged = hasChangedComponentEntrypoint(
+                        target.type, a, b, enclosingPairs);
                 response.components.changed.add(entry);
             }
         } else if (inCandidate) {
@@ -193,21 +200,26 @@ public final class ClassDiffMain {
         if (a != null && b != null) {
             response.binderImpl.resolved++;
             ChangedEntry entry = compare(className, null, null, a, b);
-            if (entry == null) {
-                for (String enclosing : enclosingClasses(className)) {
-                    Fingerprint ea = baseline.resolveBinder(enclosing);
-                    Fingerprint eb = candidate.resolveBinder(enclosing);
-                    if (ea != null && eb != null) {
+            List<Fingerprint[]> enclosingPairs = new ArrayList<>();
+            for (String enclosing : enclosingClasses(className)) {
+                Fingerprint ea = baseline.resolveBinder(enclosing);
+                Fingerprint eb = candidate.resolveBinder(enclosing);
+                if (ea != null && eb != null) {
+                    enclosingPairs.add(new Fingerprint[]{ea, eb});
+                    if (entry == null) {
                         ChangedEntry enclosingEntry = compare(className, null, null, ea, eb);
                         if (enclosingEntry != null) {
                             enclosingEntry.enclosing = enclosing;
                             entry = enclosingEntry;
-                            break;
                         }
                     }
                 }
             }
             if (entry != null) {
+                List<String> affected = affectedBinderMethods(a, b, enclosingPairs);
+                if (!affected.isEmpty()) {
+                    entry.changedMethods = affected;
+                }
                 response.binderImpl.changed.add(entry);
             }
         } else if (b != null) {
@@ -273,57 +285,371 @@ public final class ClassDiffMain {
     private static final Pattern ACCESS_METHOD = Pattern.compile("access\\$\\d+");
     private static final Pattern R8_SYM = Pattern.compile("\\$r8\\$[A-Za-z0-9_$]+");
     private static final Pattern NEST_METHOD = Pattern.compile("-?\\$\\$Nest\\$[A-Za-z0-9_$]+");
+    private static final Pattern OBF_ROOT_TYPE =
+            Pattern.compile("^([a-z]{1,4}[0-9]*|[a-zA-Z]{1,2}[0-9]*)$");
+    private static final Pattern OBF_PKG_SEG = Pattern.compile("^[a-z]{1,2}[0-9]*$");
+    private static final Pattern OBF_SIMPLE_LOWER = Pattern.compile("^[a-z]{1,3}[0-9]*$");
+    private static final Pattern OBF_SIMPLE_MIXED = Pattern.compile("^[a-zA-Z]{1,2}[0-9]*$");
+    private static final Pattern OBF_MEMBER_IN_OBF =
+            Pattern.compile("^([a-z]{1,3}[0-9]*|[a-zA-Z]{1,2}[0-9]*)$");
+    private static final Pattern OBF_MEMBER_IN_KEEP =
+            Pattern.compile("^([a-z]|[a-z][A-Z]|[a-z]{2,3}[0-9]+)$");
 
-    private static String bodyHash(ClassDef classDef) {
-        StringBuilder sb = new StringBuilder(8192);
-        List<Method> methods = new ArrayList<>();
-        classDef.getMethods().forEach(methods::add);
-        methods.sort(Comparator.comparing(ClassDiffMain::methodKey));
-        for (Method method : methods) {
+    private static boolean isStdLibClass(String desc) {
+        if (desc == null || !desc.startsWith("L") || !desc.endsWith(";")) {
+            return false;
+        }
+        String inner = desc.substring(1, desc.length() - 1);
+        return inner.startsWith("java/") || inner.startsWith("javax/")
+                || inner.startsWith("kotlin/") || inner.startsWith("kotlinx/")
+                || inner.startsWith("dalvik/") || inner.startsWith("org/json/")
+                || inner.startsWith("org/w3c/") || inner.startsWith("org/xml/");
+    }
+
+    private static boolean isObfuscatedType(String desc) {
+        if (desc == null || !desc.startsWith("L") || !desc.endsWith(";")
+                || isStdLibClass(desc)) {
+            return false;
+        }
+        String inner = desc.substring(1, desc.length() - 1);
+        int dollar = inner.indexOf('$');
+        String outer = dollar > 0 ? inner.substring(0, dollar) : inner;
+        int slash = outer.lastIndexOf('/');
+        if (slash < 0) {
+            return OBF_ROOT_TYPE.matcher(outer).matches();
+        }
+        String simple = outer.substring(slash + 1);
+        if (OBF_SIMPLE_LOWER.matcher(simple).matches()) {
+            return true;
+        }
+        if (OBF_SIMPLE_MIXED.matcher(simple).matches()) {
+            String[] pkgParts = outer.substring(0, slash).split("/");
+            for (String seg : pkgParts) {
+                if (OBF_PKG_SEG.matcher(seg).matches()) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static String normalizeTypeDesc(String desc) {
+        if (desc == null || desc.isEmpty()) {
+            return "";
+        }
+        int dims = 0;
+        while (dims < desc.length() && desc.charAt(dims) == '[') {
+            dims++;
+        }
+        String base = dims > 0 ? desc.substring(dims) : desc;
+        if (isObfuscatedType(base)) {
+            return dims > 0 ? desc.substring(0, dims) + "L#OBF;" : "L#OBF;";
+        }
+        return desc;
+    }
+
+    private static String normalizeMemberName(String definingDesc, String name) {
+        if (name == null || name.equals("<init>") || name.equals("<clinit>")
+                || isStdLibClass(definingDesc)) {
+            return name;
+        }
+        if (isObfuscatedType(definingDesc)) {
+            if (OBF_MEMBER_IN_OBF.matcher(name).matches()) {
+                return "#obf";
+            }
+        } else if (OBF_MEMBER_IN_KEEP.matcher(name).matches()) {
+            return "#obf";
+        }
+        return name;
+    }
+
+    private static String normalizedMethodKey(String definingDesc, String rawMethodKey) {
+        int lp = rawMethodKey.indexOf('(');
+        int rp = rawMethodKey.lastIndexOf(')');
+        if (lp <= 0 || rp < lp) {
+            return rawMethodKey;
+        }
+        String name = normalizeMemberName(definingDesc, rawMethodKey.substring(0, lp));
+        String paramsRaw = rawMethodKey.substring(lp + 1, rp);
+        String ret = normalizeTypeDesc(rawMethodKey.substring(rp + 1));
+        if (paramsRaw.isEmpty()) {
+            return name + "()" + ret;
+        }
+        String[] parts = paramsRaw.split(",");
+        StringBuilder sb = new StringBuilder(name).append('(');
+        for (int i = 0; i < parts.length; i++) {
+            if (i > 0) sb.append(',');
+            sb.append(normalizeTypeDesc(parts[i]));
+        }
+        return sb.append(')').append(ret).toString();
+    }
+
+    private static Map<String, String> computeMethodHashes(ClassDef classDef) {
+        Map<String, String> hashes = new HashMap<>();
+        for (Method method : classDef.getMethods()) {
             if (isSynthetic(method.getName())) {
                 continue;
             }
-            MethodImplementation implementation = method.getImplementation();
-            if (implementation == null) {
-                sb.append("abstract ").append(methodKey(method)).append('\n');
-                continue;
-            }
-            sb.append("method ").append(methodKey(method)).append('\n');
-            List<Instruction> kept = new ArrayList<>();
-            List<Integer> keptAddresses = new ArrayList<>();
-            TreeMap<Integer, Integer> addressToIndex = new TreeMap<>();
-            int address = 0;
-            for (Instruction instruction : implementation.getInstructions()) {
-                if (!isNoiseInstruction(instruction)) {
-                    addressToIndex.put(address, kept.size());
-                    kept.add(instruction);
-                    keptAddresses.add(address);
-                }
-                address += instruction.getCodeUnits();
-            }
-            int endAddress = address;
-            for (int i = 0; i < kept.size(); i++) {
-                sb.append(canonicalInstruction(kept.get(i), keptAddresses.get(i), addressToIndex))
-                        .append(';');
-            }
-            sb.append('\n');
-            for (TryBlock<? extends ExceptionHandler> tryBlock : implementation.getTryBlocks()) {
-                int start = resolveIndex(addressToIndex, tryBlock.getStartCodeAddress(),
-                        endAddress, kept.size());
-                int end = resolveIndex(addressToIndex,
-                        tryBlock.getStartCodeAddress() + tryBlock.getCodeUnitCount(),
-                        endAddress, kept.size());
-                for (ExceptionHandler handler : tryBlock.getExceptionHandlers()) {
-                    int target = resolveIndex(addressToIndex, handler.getHandlerCodeAddress(),
-                            endAddress, kept.size());
-                    sb.append("try ").append(start).append('-').append(end)
-                            .append(" -> ").append(nullSafe(handler.getExceptionType()))
-                            .append('@').append(target).append(';');
-                }
-            }
-            sb.append('\n');
+            hashes.put(methodKey(method), methodBodyHash(method));
+        }
+        return hashes;
+    }
+
+    private static String classBodyHash(String definingDesc, Map<String, String> methodHashes) {
+        List<String> entries = new ArrayList<>(methodHashes.size());
+        for (Map.Entry<String, String> entry : methodHashes.entrySet()) {
+            entries.add(normalizedMethodKey(definingDesc, entry.getKey())
+                    + '=' + entry.getValue());
+        }
+        Collections.sort(entries);
+        StringBuilder sb = new StringBuilder(Math.max(256, entries.size() * 96));
+        for (String line : entries) {
+            sb.append(line).append('\n');
         }
         return sha256(sb.toString());
+    }
+
+    private static String methodBodyHash(Method method) {
+        MethodImplementation implementation = method.getImplementation();
+        if (implementation == null) {
+            return "abstract";
+        }
+        StringBuilder sb = new StringBuilder(512);
+        List<Instruction> kept = new ArrayList<>();
+        List<Integer> keptAddresses = new ArrayList<>();
+        TreeMap<Integer, Integer> addressToIndex = new TreeMap<>();
+        int address = 0;
+        for (Instruction instruction : implementation.getInstructions()) {
+            if (!isNoiseInstruction(instruction)) {
+                addressToIndex.put(address, kept.size());
+                kept.add(instruction);
+                keptAddresses.add(address);
+            }
+            address += instruction.getCodeUnits();
+        }
+        int endAddress = address;
+        for (int i = 0; i < kept.size(); i++) {
+            sb.append(canonicalInstruction(kept.get(i), keptAddresses.get(i), addressToIndex))
+                    .append(';');
+        }
+        sb.append('\n');
+        for (TryBlock<? extends ExceptionHandler> tryBlock : implementation.getTryBlocks()) {
+            int start = resolveIndex(addressToIndex, tryBlock.getStartCodeAddress(),
+                    endAddress, kept.size());
+            int end = resolveIndex(addressToIndex,
+                    tryBlock.getStartCodeAddress() + tryBlock.getCodeUnitCount(),
+                    endAddress, kept.size());
+            for (ExceptionHandler handler : tryBlock.getExceptionHandlers()) {
+                int target = resolveIndex(addressToIndex, handler.getHandlerCodeAddress(),
+                        endAddress, kept.size());
+                sb.append("try ").append(start).append('-').append(end)
+                        .append(" -> ").append(nullSafe(handler.getExceptionType()))
+                        .append('@').append(target).append(';');
+            }
+        }
+        return sha256(sb.toString());
+    }
+
+    private static Map<String, Set<String>> computeCallEdges(ClassDef classDef) {
+        String selfDesc = classDef.getType();
+        if (selfDesc == null) {
+            return Map.of();
+        }
+        Set<String> trackedDescriptors = new HashSet<>();
+        trackedDescriptors.add(selfDesc);
+        if (selfDesc.startsWith("L") && selfDesc.endsWith(";") && selfDesc.indexOf('$') > 0) {
+            String internal = selfDesc.substring(1, selfDesc.length() - 1);
+            int idx = internal.lastIndexOf('$');
+            while (idx > 0) {
+                String prefix = internal.substring(0, idx);
+                trackedDescriptors.add("L" + prefix + ";");
+                idx = prefix.lastIndexOf('$');
+            }
+        }
+        Map<String, Set<String>> edges = new HashMap<>();
+        for (Method method : classDef.getMethods()) {
+            MethodImplementation implementation = method.getImplementation();
+            if (implementation == null) {
+                continue;
+            }
+            String callerNode = selfDesc + "->" + methodKey(method);
+            Set<String> callees = null;
+            for (Instruction instruction : implementation.getInstructions()) {
+                if (!(instruction instanceof ReferenceInstruction)) {
+                    continue;
+                }
+                Reference ref = ((ReferenceInstruction) instruction).getReference();
+                if (!(ref instanceof MethodReference)) {
+                    continue;
+                }
+                MethodReference target = (MethodReference) ref;
+                String defining = target.getDefiningClass();
+                if (!trackedDescriptors.contains(defining)) {
+                    continue;
+                }
+                if (callees == null) {
+                    callees = new HashSet<>();
+                }
+                callees.add(defining + "->" + methodRefKey(target));
+            }
+            if (callees != null) {
+                edges.put(callerNode, callees);
+            }
+        }
+        return edges;
+    }
+
+    private static List<String> affectedBinderMethods(Fingerprint implA, Fingerprint implB,
+                                                      List<Fingerprint[]> enclosingPairs) {
+        Set<String> changedNodes = new HashSet<>();
+        collectChangedNodes(implA, implB, changedNodes);
+        for (Fingerprint[] pair : enclosingPairs) {
+            collectChangedNodes(pair[0], pair[1], changedNodes);
+        }
+        if (changedNodes.isEmpty()) {
+            return List.of();
+        }
+        Map<String, Set<String>> graph = new HashMap<>(implB.callEdges);
+        for (Fingerprint[] pair : enclosingPairs) {
+            graph.putAll(pair[1].callEdges);
+        }
+        List<String> affected = new ArrayList<>();
+        for (String mKey : implB.methodHashes.keySet()) {
+            if (mKey.startsWith("<init>(") || mKey.startsWith("<clinit>(")) {
+                continue;
+            }
+            String start = implB.descriptor + "->" + mKey;
+            if (reachesChanged(start, changedNodes, graph)) {
+                affected.add(mKey);
+            }
+        }
+        Collections.sort(affected);
+        return affected;
+    }
+
+    private static void collectChangedNodes(Fingerprint a, Fingerprint b, Set<String> out) {
+        if (a.descriptor == null || b.descriptor == null) {
+            return;
+        }
+        Map<String, Integer> baselineBag = new HashMap<>();
+        for (Map.Entry<String, String> e : a.methodHashes.entrySet()) {
+            String sig = normalizedMethodKey(a.descriptor, e.getKey()) + '=' + e.getValue();
+            baselineBag.merge(sig, 1, Integer::sum);
+        }
+        for (Map.Entry<String, String> e : b.methodHashes.entrySet()) {
+            String key = e.getKey();
+            String ha = a.methodHashes.get(key);
+            if (ha != null && ha.equals(e.getValue())) {
+                continue;
+            }
+            String sig = normalizedMethodKey(b.descriptor, key) + '=' + e.getValue();
+            Integer remaining = baselineBag.get(sig);
+            if (remaining != null && remaining > 0) {
+                baselineBag.put(sig, remaining - 1);
+                continue;
+            }
+            out.add(b.descriptor + "->" + key);
+        }
+        for (String key : a.methodHashes.keySet()) {
+            if (!b.methodHashes.containsKey(key)) {
+                String sig = normalizedMethodKey(a.descriptor, key) + '=' + a.methodHashes.get(key);
+                Integer remaining = baselineBag.get(sig);
+                if (remaining != null && remaining > 0) {
+                    out.add(b.descriptor + "->" + key);
+                }
+            }
+        }
+    }
+
+    private static boolean reachesChanged(String start, Set<String> changedNodes,
+                                          Map<String, Set<String>> graph) {
+        if (changedNodes.contains(start)) {
+            return true;
+        }
+        Set<String> visited = new HashSet<>();
+        Deque<String> queue = new ArrayDeque<>();
+        visited.add(start);
+        queue.add(start);
+        while (!queue.isEmpty()) {
+            String current = queue.poll();
+            Set<String> next = graph.get(current);
+            if (next == null) {
+                continue;
+            }
+            for (String callee : next) {
+                if (changedNodes.contains(callee)) {
+                    return true;
+                }
+                if (visited.add(callee)) {
+                    queue.add(callee);
+                }
+            }
+        }
+        return false;
+    }
+
+    private static final Set<String> ACTIVITY_ENTRYPOINTS = Set.of(
+            "onCreate", "onNewIntent", "onActivityResult", "onStart", "onResume");
+    private static final Set<String> SERVICE_ENTRYPOINTS = Set.of(
+            "onCreate", "onStartCommand", "onStart", "onBind", "onRebind",
+            "onHandleIntent", "onHandleWork", "onStartJob", "onStopJob");
+    private static final Set<String> RECEIVER_ENTRYPOINTS = Set.of("onReceive");
+    private static final Set<String> PROVIDER_ENTRYPOINTS = Set.of(
+            "onCreate", "query", "insert", "bulkInsert", "update", "delete", "call",
+            "openFile", "openAssetFile", "openTypedAssetFile", "getType", "applyBatch");
+
+    private static boolean isComponentEntrypoint(String componentType, String methodName) {
+        if (componentType == null || methodName == null) {
+            return false;
+        }
+        switch (componentType) {
+            case "activity":
+                return ACTIVITY_ENTRYPOINTS.contains(methodName);
+            case "service":
+                return SERVICE_ENTRYPOINTS.contains(methodName);
+            case "receiver":
+                return RECEIVER_ENTRYPOINTS.contains(methodName);
+            case "provider":
+                return PROVIDER_ENTRYPOINTS.contains(methodName);
+            default:
+                return false;
+        }
+    }
+
+    private static boolean hasChangedComponentEntrypoint(String componentType,
+                                                         Fingerprint compA, Fingerprint compB,
+                                                         List<Fingerprint[]> enclosingPairs) {
+        Set<String> changedNodes = new HashSet<>();
+        collectChangedNodes(compA, compB, changedNodes);
+        for (Fingerprint[] pair : enclosingPairs) {
+            collectChangedNodes(pair[0], pair[1], changedNodes);
+        }
+        if (changedNodes.isEmpty()) {
+            return false;
+        }
+        Map<String, Set<String>> graph = new HashMap<>(compB.callEdges);
+        for (Fingerprint[] pair : enclosingPairs) {
+            graph.putAll(pair[1].callEdges);
+        }
+        for (String mKey : compB.methodHashes.keySet()) {
+            int paren = mKey.indexOf('(');
+            if (paren <= 0) {
+                continue;
+            }
+            String methodName = mKey.substring(0, paren);
+            if (!isComponentEntrypoint(componentType, methodName)) {
+                continue;
+            }
+            if (reachesChanged(compB.descriptor + "->" + mKey, changedNodes, graph)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String methodRefKey(MethodReference method) {
+        return method.getName() + "(" + String.join(",", method.getParameterTypes()) + ")"
+                + method.getReturnType();
     }
 
     private static boolean isNoiseInstruction(Instruction instruction) {
@@ -415,15 +741,24 @@ public final class ClassDiffMain {
         }
         String raw;
         if (reference instanceof TypeReference) {
-            raw = "T:" + ((TypeReference) reference).getType();
+            raw = "T:" + normalizeTypeDesc(((TypeReference) reference).getType());
         } else if (reference instanceof FieldReference) {
             FieldReference field = (FieldReference) reference;
-            raw = "F:" + field.getDefiningClass() + "->" + field.getName() + ":" + field.getType();
+            String defining = field.getDefiningClass();
+            raw = "F:" + normalizeTypeDesc(defining) + "->"
+                    + normalizeMemberName(defining, field.getName()) + ":"
+                    + normalizeTypeDesc(field.getType());
         } else if (reference instanceof MethodReference) {
             MethodReference method = (MethodReference) reference;
-            raw = "M:" + method.getDefiningClass() + "->" + method.getName()
-                    + "(" + String.join(",", method.getParameterTypes()) + ")"
-                    + method.getReturnType();
+            String defining = method.getDefiningClass();
+            List<String> params = new ArrayList<>();
+            for (CharSequence param : method.getParameterTypes()) {
+                params.add(normalizeTypeDesc(param.toString()));
+            }
+            raw = "M:" + normalizeTypeDesc(defining) + "->"
+                    + normalizeMemberName(defining, method.getName())
+                    + "(" + String.join(",", params) + ")"
+                    + normalizeTypeDesc(method.getReturnType());
         } else {
             raw = reference.getClass().getSimpleName() + ":" + reference;
         }
@@ -559,12 +894,21 @@ public final class ClassDiffMain {
     private static final class Fingerprint {
         final String bodyHash;
         final String container;
+        final String descriptor;
         final List<String> referencedEnclosing;
+        final Map<String, String> methodHashes;
+        final Map<String, Set<String>> callEdges;
 
-        Fingerprint(String bodyHash, String container, List<String> referencedEnclosing) {
+        Fingerprint(String bodyHash, String container, String descriptor,
+                    List<String> referencedEnclosing,
+                    Map<String, String> methodHashes,
+                    Map<String, Set<String>> callEdges) {
             this.bodyHash = bodyHash;
             this.container = container;
+            this.descriptor = descriptor;
             this.referencedEnclosing = referencedEnclosing;
+            this.methodHashes = methodHashes;
+            this.callEdges = callEdges;
         }
     }
 
@@ -701,10 +1045,13 @@ public final class ClassDiffMain {
                         if (!wanted.contains(type) || fingerprints.containsKey(type)) {
                             continue;
                         }
-                        String bodyHash = body ? bodyHash(classDef) : "";
+                        Map<String, String> methodHashes = body ? computeMethodHashes(classDef) : Map.of();
+                        String bodyHash = body ? classBodyHash(classDef.getType(), methodHashes) : "";
                         List<String> refEnclosing = referencedEnclosingClasses(classDef);
+                        Map<String, Set<String>> callEdges = body ? computeCallEdges(classDef) : Map.of();
                         fingerprints.put(type, new Fingerprint(bodyHash,
-                                relative + "!" + entryName, refEnclosing));
+                                relative + "!" + entryName, classDef.getType(),
+                                refEnclosing, methodHashes, callEdges));
                     }
                 }
             } catch (Exception e) {
@@ -731,10 +1078,13 @@ public final class ClassDiffMain {
                         if (!targetKey.equals(type)) {
                             continue;
                         }
-                        String bodyHash = body ? bodyHash(classDef) : "";
+                        Map<String, String> methodHashes = body ? computeMethodHashes(classDef) : Map.of();
+                        String bodyHash = body ? classBodyHash(classDef.getType(), methodHashes) : "";
                         List<String> refEnclosing = referencedEnclosingClasses(classDef);
+                        Map<String, Set<String>> callEdges = body ? computeCallEdges(classDef) : Map.of();
                         fingerprints.put(type, new Fingerprint(bodyHash,
-                                relative + "!" + entryName, refEnclosing));
+                                relative + "!" + entryName, classDef.getType(),
+                                refEnclosing, methodHashes, callEdges));
                         return;
                     }
                 }
@@ -833,7 +1183,11 @@ public final class ClassDiffMain {
         String type;
         @SerializedName("body_changed")
         boolean bodyChanged;
+        @SerializedName("entrypoint_changed")
+        Boolean entrypointChanged;
         String enclosing;
+        @SerializedName("changed_methods")
+        List<String> changedMethods;
         String baseline;
         String candidate;
     }

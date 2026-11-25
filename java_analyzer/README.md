@@ -117,8 +117,9 @@ android.app.ILocaleManager.getApplicationLocales(java.lang.String, int):android.
 
 - 入口：`net.wrlu.android.ase.classdiff.ClassDiffMain`
 - 依赖：`com.android.tools.smali:smali-dexlib2`
-- 用途：对 APK、`packages/android/*.jar`、APEX `javalib/*.jar` 中的类做规范化方法体指纹比较
-- 只比较方法体：方法签名、归一化指令、引用、字面量、分支/switch/try-catch；不比较字段、注解、继承关系、debug 信息、地址与寄存器
+- 用途：对 APK、`packages/android/*.jar`、APEX `javalib/*.jar` 中的类做逐方法规范化指纹比较与 `{impl, enclosing}` 调用图传播
+- 只比较方法体：归一化指令（归并宽度变体、跳过 `nop`/寄存器间 `move*`）、规范化引用（合成符号及非标准库 R8 短混淆符号）、字面量（资源 ID 归一化为 `#RES`）、分支/switch/try-catch；不比较字段、注解、继承关系、debug 信息、地址与寄存器
+- 输出类级变化（含薄壳内部类的外部类补盲）、Binder 侧 `changed_methods` 以及组件侧 `entrypoint_changed`
 - 通过 `diff_analyzer` 自动调用；默认 `-Xmx4g`，可用 `ASE_CLASS_DIFF_XMX` 调整
 
 ---

@@ -105,6 +105,7 @@ apex
       "components": {
         "added": ["com.example/com.example.New"],
         "removed": [],
+        "entrypoint_changed": ["com.example/com.example.MainActivity"],
         "changed": ["com.example/com.example.Svc"],
         "newly_exported": ["com.example/com.example.New"],
         "newly_hidden": [],
@@ -131,7 +132,8 @@ apex
 | 字段 | 含义 |
 |------|------|
 | `added` / `removed` | 组件新增/删除 |
-| `changed` | 任一组件属性变化 |
+| `entrypoint_changed` | 组件框架入口回调（如 `onCreate`/`onNewIntent`/`onStartCommand`/`onBind`/`onReceive`/`query`/`call` 等）直接或经类内/外部类调用链发生方法体变化 |
+| `changed` | 其余非入口方法体变化，或涉及 `newly_accessible` / `no_longer_accessible` 的清单变化（不含已在 `entrypoint_changed` 中的组件；不涉及可达性变化的纯清单属性改动不计入 `changed`） |
 | `newly_exported` / `newly_hidden` | `exported` 变为 true/false |
 | `permission_changed` | 组件 `android:permission` 变化 |
 | `provider_permission_changed` | provider 读/写权限变化 |
@@ -196,7 +198,8 @@ apex
         "status": "body_changed"
       },
       "methods_added": ["..."],
-      "methods_removed": ["..."]
+      "methods_removed": ["..."],
+      "methods_changed": ["..."]
     }
   ]
 }
@@ -206,6 +209,7 @@ apex
 - `newly_accessible` / `newly_blocked`：最终可达性状态集合，包含新增可达、变更可达、移除不可达、变更不可达；不等同于单纯的 `False→True` / `True→False`。
 - `changed`：接口级明细，不再带冗余的 `status` 字段。
 - 已有服务上的接口新增/删除也进入 `changed`，通过 `methods_added` / `methods_removed` 表达；AIDL 签名未变但 `impl` 类方法体发生变化的 Java 接口（纯 `body_changed`）同样进入 `changed`，且不输出 `methods_added` / `methods_removed`。
+- `methods_changed`：Java 接口双侧共有的 AIDL 方法中，自身方法体变化或经 `{impl, enclosing}` 类内/外部类调用链可达变更方法的精确子集（格式与 `methods_added` / `methods_removed` 一致，为空时省略）；与类级 `impl.status = "body_changed"` 构成两层信号。
 - `type`：`java` / `native`；native 条目没有 `impl`。
 - `impl.status`：`body_changed` / `unchanged` / `added` / `removed` / `unresolved`；impl 类被替换时额外输出 `old`；若薄壳内部类（如 `$BinderService` / `$Stub`）本身未变但其外部类（enclosing class）方法体发生变化，也会标为 `body_changed` 并额外输出 `enclosing` 指向发生变化的外部类。
 - Native 接口的 `.so` / `backend` 变化：
@@ -256,7 +260,7 @@ apex
 指纹只包含：
 
 - 方法签名；
-- 归一化指令（归并 `/range`、`/2addr`、`/lit8`、`/lit16`、`const-string/jumbo`、`goto/*`、`const/*`、`const-wide/*` 等编码宽度变体，跳过 `nop` 与寄存器间 `move*`）、规范化引用（归一化 `$$ExternalSynthetic*`、`lambda$...$N`、`access$N`、`$r8$*`、`-$$Nest$*` 合成符号）、字面量（Android `0x01`/`0x7f` 资源 ID 归一化为 `#RES`）、分支/switch keys、try/catch；
+- 归一化指令（归并 `/range`、`/2addr`、`/lit8`、`/lit16`、`const-string/jumbo`、`goto/*`、`const/*`、`const-wide/*` 等编码宽度变体，跳过 `nop` 与寄存器间 `move*`）、规范化引用（归一化 `$$ExternalSynthetic*`、`lambda$...$N`、`access$N`、`$r8$*`、`-$$Nest$*` 合成符号，以及非标准库类的 R8 短混淆类名/方法名/字段名，覆盖组件与 Binder 两侧）、字面量（Android `0x01`/`0x7f` 资源 ID 归一化为 `#RES`）、分支/switch keys、try/catch；
 - 排除 debug 信息、地址、寄存器、synthetic 方法（`lambda$`、`$$ExternalSynthetic`、`access$`、`$r8$`、`-$$Nest$`）；
 - 字段、注解、类继承关系等结构变化不计入。
 

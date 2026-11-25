@@ -1281,7 +1281,9 @@ def class_status(className, maps):
         return {
             'status': 'changed',
             'body_changed': item.get('body_changed'),
+            'entrypoint_changed': bool(item.get('entrypoint_changed')),
             'enclosing': item.get('enclosing'),
+            'changed_methods': item.get('changed_methods') or [],
             'baseline': item.get('baseline'),
             'candidate': item.get('candidate'),
         }
@@ -1433,7 +1435,16 @@ def merge_components(old, bytecode, baseline, candidate):
                 if status == 'removed' and accessibility.get('from') is not None:
                     add(name, 'no_longer_accessible', component['name'])
         for component in entry.get('changed', []):
-            add(name, 'changed', component['name'])
+            class_info = component.get('class') or {}
+            accessibility = component.get('accessibility') or {}
+            is_newly_accessible = (accessibility.get('from') is None
+                                   and accessibility.get('to') is not None)
+            is_no_longer_accessible = (accessibility.get('to') is None
+                                       and accessibility.get('from') is not None)
+            if class_info.get('entrypoint_changed'):
+                add(name, 'entrypoint_changed', component['name'])
+            elif class_info or is_newly_accessible or is_no_longer_accessible:
+                add(name, 'changed', component['name'])
             exported = component.get('exported') or {}
             if exported.get('to') is True:
                 add(name, 'newly_exported', component['name'])
@@ -1443,10 +1454,9 @@ def merge_components(old, bytecode, baseline, candidate):
                 add(name, 'permission_changed', component['name'])
             if 'provider_permissions' in component:
                 add(name, 'provider_permission_changed', component['name'])
-            accessibility = component.get('accessibility') or {}
-            if accessibility.get('from') is None and accessibility.get('to') is not None:
+            if is_newly_accessible:
                 add(name, 'newly_accessible', component['name'])
-            if accessibility.get('to') is None and accessibility.get('from') is not None:
+            if is_no_longer_accessible:
                 add(name, 'no_longer_accessible', component['name'])
             if 'intent_filters' in component:
                 add(name, 'intent_filter_changed', component['name'])
@@ -1467,7 +1477,7 @@ def merge_components(old, bytecode, baseline, candidate):
             add(package, 'unresolved_classes', item.get('class'))
 
     array_keys = {
-        'added', 'removed', 'changed', 'newly_exported', 'newly_hidden',
+        'added', 'removed', 'entrypoint_changed', 'changed', 'newly_exported', 'newly_hidden',
         'permission_changed', 'provider_permission_changed',
         'newly_accessible', 'no_longer_accessible',
         'intent_filter_changed', 'path_permission_changed',
@@ -1519,6 +1529,69 @@ def merge_components(old, bytecode, baseline, candidate):
     }
 
 
+DEX_PRIMITIVES = {
+    'Z': 'boolean', 'B': 'byte', 'S': 'short', 'C': 'char',
+    'I': 'int', 'J': 'long', 'F': 'float', 'D': 'double', 'V': 'void',
+}
+
+
+def dex_type_to_java(desc):
+    desc = (desc or '').strip()
+    dims = 0
+    while desc.startswith('['):
+        dims += 1
+        desc = desc[1:]
+    if desc in DEX_PRIMITIVES:
+        base = DEX_PRIMITIVES[desc]
+    elif desc.startswith('L') and desc.endswith(';'):
+        base = desc[1:-1].replace('/', '.').replace('$', '.')
+    else:
+        base = desc.replace('/', '.').replace('$', '.')
+    return base + '[]' * dims
+
+
+def dex_method_key_to_norm(key):
+    if not key or '(' not in key or ')' not in key:
+        return None
+    name, rest = key.split('(', 1)
+    params_raw, ret_raw = rest.rsplit(')', 1)
+    params = tuple(dex_type_to_java(p) for p in params_raw.split(',') if p.strip())
+    return name.strip(), params, dex_type_to_java(ret_raw)
+
+
+def strip_generics(text):
+    out = []
+    depth = 0
+    for ch in text:
+        if ch == '<':
+            depth += 1
+        elif ch == '>':
+            if depth > 0:
+                depth -= 1
+        elif depth == 0:
+            out.append(ch)
+    return ''.join(out)
+
+
+def aidl_sig_to_norm(sig):
+    if not sig or '(' not in sig or '):' not in sig:
+        return None
+    clean = strip_generics(sig.strip())
+    left, rest = clean.split('(', 1)
+    params_raw, ret_raw = rest.rsplit('):', 1)
+    name = left.rsplit('.', 1)[-1].strip()
+    params = []
+    for item in params_raw.split(','):
+        part = item.strip()
+        if not part:
+            continue
+        if part.endswith('...'):
+            part = part[:-3].strip() + '[]'
+        params.append(part.replace('$', '.'))
+    ret = ret_raw.strip().replace('$', '.')
+    return name, tuple(params), ret
+
+
 def merge_services(old, bytecode, baseline, candidate):
     maps = bytecode_class_maps(bytecode, 'binder_impl')
     aidl_a, _ = load_aidl(baseline)
@@ -1533,14 +1606,32 @@ def merge_services(old, bytecode, baseline, candidate):
     def impl_info(impl):
         info = class_status(impl, maps)
         if not info:
-            return 'unchanged', None
+            return 'unchanged', None, []
         status = info.get('status') or 'unchanged'
-        return ('body_changed' if status == 'changed' else status), info.get('enclosing')
+        return (
+            'body_changed' if status == 'changed' else status,
+            info.get('enclosing'),
+            info.get('changed_methods') or [],
+        )
 
-    def entry(service, kind, descriptor, impl, old=None, added=None, removed=None):
+    def matched_changed_methods(service, kind, descriptor, impl):
+        if kind != 'java' or not impl:
+            return []
+        status, _enclosing, dex_methods = impl_info(impl)
+        if status != 'body_changed' or not dex_methods:
+            return []
+        dex_norm = {norm for key in dex_methods
+                    for norm in (dex_method_key_to_norm(key),) if norm}
+        if not dex_norm:
+            return []
+        common = sorted(set(methods_of(aidl_a, service, kind, descriptor))
+                        & set(methods_of(aidl_b, service, kind, descriptor)))
+        return [sig for sig in common if aidl_sig_to_norm(sig) in dex_norm]
+
+    def entry(service, kind, descriptor, impl, old=None, added=None, removed=None, changed=None):
         item = {'name': service, 'type': kind, 'descriptor': descriptor}
         if impl:
-            status, enclosing = impl_info(impl)
+            status, enclosing, _dex_methods = impl_info(impl)
             impl_obj = {'name': impl}
             if old and old != impl:
                 impl_obj['old'] = old
@@ -1552,6 +1643,8 @@ def merge_services(old, bytecode, baseline, candidate):
             item['methods_added'] = added
         if removed:
             item['methods_removed'] = removed
+        if changed:
+            item['methods_changed'] = changed
         return item
 
     result = {
@@ -1604,7 +1697,8 @@ def merge_services(old, bytecode, baseline, candidate):
         changed_entry = entry(
             name, kind, descriptor, candidate_impl, old=baseline_impl,
             added=item.get('methods_added') or None,
-            removed=item.get('methods_removed') or None)
+            removed=item.get('methods_removed') or None,
+            changed=matched_changed_methods(name, kind, descriptor, candidate_impl) or None)
         if isinstance(item.get('so'), dict):
             changed_entry['so'] = {
                 'value': item['so'].get('to'), 'old': item['so'].get('from')}
@@ -1626,7 +1720,9 @@ def merge_services(old, bytecode, baseline, candidate):
                     continue
                 impl = blocks_b[key].get('impl')
                 if impl and impl_info(impl)[0] == 'body_changed':
-                    changed_entries.append(entry(name, kind, descriptor, impl))
+                    changed_entries.append(entry(
+                        name, kind, descriptor, impl,
+                        changed=matched_changed_methods(name, kind, descriptor, impl) or None))
                     seen_interfaces.add((name, kind, descriptor))
 
     result['changed'] = sorted(changed_entries, key=lambda x: (x['name'], x['descriptor']))
@@ -1719,6 +1815,9 @@ def main(argv=None):
             component_summary = components_result['summary']
             packages = component_summary['packages']
             components = component_summary['components']
+            entrypoint_changed_components = sum(
+                len((package.get('components') or {}).get('entrypoint_changed') or [])
+                for package in report['packages']['changed'])
             changed_components = sum(
                 len((package.get('components') or {}).get('changed') or [])
                 for package in report['packages']['changed'])
@@ -1726,6 +1825,7 @@ def main(argv=None):
                   f"(+{packages['added']} / -{packages['removed']})")
             print(f"  components:{components['baseline']} -> {components['candidate']} "
                   f"(+{components['added']} / -{components['removed']})")
+            print(f"  entrypoint changed: {entrypoint_changed_components}")
             print(f"  changed components: {changed_components}")
             print(f"  newly exported:   {components['newly_exported']}")
             print(f"  newly accessible: {components['newly_accessible']}")
