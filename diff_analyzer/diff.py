@@ -1281,6 +1281,7 @@ def class_status(className, maps):
         return {
             'status': 'changed',
             'body_changed': item.get('body_changed'),
+            'enclosing': item.get('enclosing'),
             'baseline': item.get('baseline'),
             'candidate': item.get('candidate'),
         }
@@ -1529,20 +1530,23 @@ def merge_services(old, bytecode, baseline, candidate):
     def methods_of(aidl, service, kind, descriptor):
         return list(block_of(aidl, service, kind, descriptor).get('methods') or [])
 
-    def impl_status(impl):
+    def impl_info(impl):
         info = class_status(impl, maps)
         if not info:
-            return 'unchanged'
+            return 'unchanged', None
         status = info.get('status') or 'unchanged'
-        return 'body_changed' if status == 'changed' else status
+        return ('body_changed' if status == 'changed' else status), info.get('enclosing')
 
     def entry(service, kind, descriptor, impl, old=None, added=None, removed=None):
         item = {'name': service, 'type': kind, 'descriptor': descriptor}
         if impl:
+            status, enclosing = impl_info(impl)
             impl_obj = {'name': impl}
             if old and old != impl:
                 impl_obj['old'] = old
-            impl_obj['status'] = impl_status(impl)
+            impl_obj['status'] = status
+            if enclosing:
+                impl_obj['enclosing'] = enclosing
             item['impl'] = impl_obj
         if added:
             item['methods_added'] = added
@@ -1571,6 +1575,7 @@ def merge_services(old, bytecode, baseline, candidate):
         item['name'] for item in old['services']['accessibility_changed']
         if item.get('to') is False})
 
+    seen_interfaces = set()
     for item in old['interfaces']['added']:
         if item['service'] in added_services:
             continue
@@ -1579,6 +1584,7 @@ def merge_services(old, bytecode, baseline, candidate):
         changed_entries.append(entry(
             name, kind, descriptor, block.get('impl') or item.get('impl'),
             added=methods_of(aidl_b, name, kind, descriptor)))
+        seen_interfaces.add((name, kind, descriptor))
     for item in old['interfaces']['removed']:
         if item['service'] in removed_services:
             continue
@@ -1587,6 +1593,7 @@ def merge_services(old, bytecode, baseline, candidate):
         changed_entries.append(entry(
             name, kind, descriptor, block.get('impl') or item.get('impl'),
             removed=methods_of(aidl_a, name, kind, descriptor)))
+        seen_interfaces.add((name, kind, descriptor))
     for item in old['interfaces']['changed']:
         name, kind, descriptor = item['service'], item['kind'], item['descriptor']
         candidate_impl = block_of(aidl_b, name, kind, descriptor).get('impl')
@@ -1605,6 +1612,22 @@ def merge_services(old, bytecode, baseline, candidate):
             changed_entry['backend'] = {
                 'value': item['backend'].get('to'), 'old': item['backend'].get('from')}
         changed_entries.append(changed_entry)
+        seen_interfaces.add((name, kind, descriptor))
+
+    if old['availability'].get('aidl'):
+        for name in sorted(set(aidl_a) & set(aidl_b)):
+            if name in added_services or name in removed_services:
+                continue
+            blocks_a = aidl_a[name]
+            blocks_b = aidl_b[name]
+            for key in sorted(set(blocks_a) & set(blocks_b)):
+                kind, descriptor = key
+                if kind != 'java' or (name, kind, descriptor) in seen_interfaces:
+                    continue
+                impl = blocks_b[key].get('impl')
+                if impl and impl_info(impl)[0] == 'body_changed':
+                    changed_entries.append(entry(name, kind, descriptor, impl))
+                    seen_interfaces.add((name, kind, descriptor))
 
     result['changed'] = sorted(changed_entries, key=lambda x: (x['name'], x['descriptor']))
     return result
@@ -1649,7 +1672,7 @@ def main(argv=None):
         else candidate / 'diff.json'
 
     report = {
-        'schema_version': 2,
+        'schema_version': 3,
         'generated_at': datetime.now().astimezone().isoformat(timespec='seconds'),
         'files': {'baseline': str(baseline), 'candidate': str(candidate)},
     }

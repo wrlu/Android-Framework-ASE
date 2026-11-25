@@ -205,9 +205,9 @@ apex
 - `added` / `removed`：只列服务注册名，不展开接口/方法。
 - `newly_accessible` / `newly_blocked`：最终可达性状态集合，包含新增可达、变更可达、移除不可达、变更不可达；不等同于单纯的 `False→True` / `True→False`。
 - `changed`：接口级明细，不再带冗余的 `status` 字段。
-- 已有服务上的接口新增/删除也进入 `changed`，通过 `methods_added` / `methods_removed` 表达。
+- 已有服务上的接口新增/删除也进入 `changed`，通过 `methods_added` / `methods_removed` 表达；AIDL 签名未变但 `impl` 类方法体发生变化的 Java 接口（纯 `body_changed`）同样进入 `changed`，且不输出 `methods_added` / `methods_removed`。
 - `type`：`java` / `native`；native 条目没有 `impl`。
-- `impl.status`：`body_changed` / `unchanged` / `added` / `removed` / `unresolved`；impl 类被替换时额外输出 `old`。
+- `impl.status`：`body_changed` / `unchanged` / `added` / `removed` / `unresolved`；impl 类被替换时额外输出 `old`；若薄壳内部类（如 `$BinderService` / `$Stub`）本身未变但其外部类（enclosing class）方法体发生变化，也会标为 `body_changed` 并额外输出 `enclosing` 指向发生变化的外部类。
 - Native 接口的 `.so` / `backend` 变化：
 
 ```json
@@ -248,7 +248,7 @@ apex
 
 类差异不单独输出 `bytecode`，而是并入 `packages` 与 `binder`：
 
-- 组件类按 `all_comp.json` 的声明类解析（activity-alias 用 `targetActivity`）；
+- 组件类按 `all_comp.json` 的声明类解析（activity-alias 用 `targetActivity`）；若内部类组件本身未变，但方法体中实际引用了其外部类（调用外部类方法或访问外部类字段）且该外部类发生变化，也会记入变更；
 - 组件新增/删除时，类状态固定为 `added` / `removed`（即使该类在另一侧已存在）；只有两侧都存在的组件才比较方法体；
 - Binder impl 类来自 `service_aidl.txt`，所有 impl 都执行真实类检测；有 `methods_added/removed` 也不跳过；
 - 内部类 `$` / `.` 自动归一化；只输出变化和无解析结果，未变化的类不展开。
@@ -256,8 +256,8 @@ apex
 指纹只包含：
 
 - 方法签名；
-- 归一化指令、引用、字面量、分支/switch keys、try/catch；
-- 排除 debug 信息、地址、寄存器、synthetic 方法（`lambda$`、`$$ExternalSynthetic`、`access$`、`$r8$`）；
+- 归一化指令（归并 `/range`、`/2addr`、`/lit8`、`/lit16`、`const-string/jumbo`、`goto/*`、`const/*`、`const-wide/*` 等编码宽度变体，跳过 `nop` 与寄存器间 `move*`）、规范化引用（归一化 `$$ExternalSynthetic*`、`lambda$...$N`、`access$N`、`$r8$*`、`-$$Nest$*` 合成符号）、字面量（Android `0x01`/`0x7f` 资源 ID 归一化为 `#RES`）、分支/switch keys、try/catch；
+- 排除 debug 信息、地址、寄存器、synthetic 方法（`lambda$`、`$$ExternalSynthetic`、`access$`、`$r8$`、`-$$Nest$`）；
 - 字段、注解、类继承关系等结构变化不计入。
 
 APK sha256 只在运行期用于判断包是否变化、跳过未变包的类检测，不写入最终 `diff.json`。
