@@ -21,17 +21,19 @@ show_help() {
 Usage: $(basename "$0") [OPTIONS] <workspace_dir>
 
 Run the end-to-end Android Framework Attack Surface Explorer pipeline:
-  [Collector] -> [Java Analyzer] -> [Native Analyzer] -> [Post Analyzer]
+  [Collector] -> [Java Analyzer] -> [Native Analyzer] -> [Post Analyzer] -> [DexExport]
 
 Arguments:
   <workspace_dir>         Directory for dumped firmware and analysis results.
 
 Workflow Modes:
-  (default)               Full pipeline: collect from device and analyze.
+  (default)               Full pipeline: collect, analyze, and export dex_index.db.
   --analyze-only, --skip-collect
-                          Skip collection phase, run all analyzers on existing dump.
+                          Skip collection phase, run Java/Native/Post analyzers only.
   --collect-only          Run firmware collection only, skip analysis phases.
   --probe-only            Only refresh accessible_services.txt on device, then run analyzers.
+  --dex-export            Export full DEX feature database (dex_index.db) only (combine with
+                          --analyze-only to run both).
 
 Collector Options:
   -d, --device <serial>   Target adb device serial ID.
@@ -76,6 +78,9 @@ SKIP_COMPONENTS=false
 SKIP_JAVA=false
 SKIP_NATIVE=false
 SKIP_POST=false
+ANALYZE_ONLY=false
+DEX_EXPORT_FLAG=false
+RUN_DEX_EXPORT=true
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -85,6 +90,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --analyze-only|--skip-collect)
             COLLECT_MODE="skip"
+            ANALYZE_ONLY=true
             shift
             ;;
         --collect-only)
@@ -93,6 +99,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --probe-only)
             COLLECT_MODE="probe_only"
+            shift
+            ;;
+        --dex-export)
+            DEX_EXPORT_FLAG=true
             shift
             ;;
         -d|--device)
@@ -162,6 +172,18 @@ if [ -z "$WORKSPACE" ]; then
     echo -e "${RED}Error: <workspace_dir> is required.${NC}" >&2
     show_help
     exit 1
+fi
+
+if [ "$DEX_EXPORT_FLAG" = true ] && [ "$ANALYZE_ONLY" = false ]; then
+    COLLECT_MODE="skip"
+    SKIP_JAVA=true
+    SKIP_NATIVE=true
+    SKIP_POST=true
+    RUN_DEX_EXPORT=true
+elif [ "$ANALYZE_ONLY" = true ] && [ "$DEX_EXPORT_FLAG" = false ]; then
+    RUN_DEX_EXPORT=false
+elif [ "$COMPONENTS_ONLY" = true ] || [ "$AIDL_ONLY" = true ] || [ "$ANALYSIS_MODE" = "collect_only" ]; then
+    RUN_DEX_EXPORT=false
 fi
 
 mkdir -p "$WORKSPACE"
@@ -288,6 +310,18 @@ if [ "$SKIP_POST" = false ] && [ "$COMPONENTS_ONLY" = false ]; then
 fi
 
 # ==============================================================================
+# Phase 5: DEX Feature Database Export
+# ==============================================================================
+if [ "$RUN_DEX_EXPORT" = true ]; then
+    echo
+    echo -e "${GREEN}${BOLD}============================================================${NC}"
+    echo -e "${GREEN}${BOLD}[ASE] Phase 5: DEX Feature Database Export (dex_index.db)${NC}"
+    echo -e "${GREEN}${BOLD}============================================================${NC}"
+
+    "$SCRIPT_DIR/java_analyzer/analyzer.sh" "$WORKSPACE" --dex-export
+fi
+
+# ==============================================================================
 # Summary
 # ==============================================================================
 echo
@@ -303,4 +337,5 @@ echo -e "${BOLD}Output artifacts:${NC}"
 [ -f "$WORKSPACE/native_aidl.txt" ] && echo -e "  - Native AIDL:           $WORKSPACE/native_aidl.txt"
 [ -f "$WORKSPACE/accessible_native_aidl.txt" ] && echo -e "  - Accessible Native AIDL:$WORKSPACE/accessible_native_aidl.txt"
 [ -f "$WORKSPACE/unresolved_accessible_services.txt" ] && echo -e "  - Unresolved Blindspots: $WORKSPACE/unresolved_accessible_services.txt"
+[ -f "$WORKSPACE/dex_index.db" ] && echo -e "  - DEX Feature DB:        $WORKSPACE/dex_index.db"
 echo

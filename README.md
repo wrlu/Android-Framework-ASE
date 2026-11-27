@@ -75,11 +75,14 @@ Android 固件攻击面分析工具，覆盖「固件采集 → 静态分析 →
 ### 一键全流程
 
 ```bash
-# 采集 + Java + Native + 后处理
+# 采集 + Java + Native + 后处理 + DEX 特征库导出
 ./run.sh <workspace_dir>
 
-# 对已有 dump 只做分析
+# 对已有 dump 只做原有静态分析（Java + Native + 后处理）
 ./run.sh <workspace_dir> --analyze-only
+
+# 仅导出全量 DEX 特征库（dex_index.db）
+./run.sh <workspace_dir> --dex-export
 
 # 只刷新实机可达性后重新分析
 ./run.sh <workspace_dir> --probe-only
@@ -181,6 +184,7 @@ python3 AttackSurfaceExplorer/runner.py \
 ├── native_aidl.txt                     # Native AIDL
 ├── accessible_native_aidl.txt          # Native AIDL：可达子集
 ├── unresolved_accessible_services.txt  # 盲区服务
+├── dex_index.db                        # 全量 DEX 特征库（SQLite）
 └── diff.json                           # 可选：镜像差异
 ```
 

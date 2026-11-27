@@ -12,12 +12,13 @@ if [ "${1:-}" = "--build" ] || [ "${1:-}" = "build" ]; then
 fi
 
 if [ $# -lt 1 ]; then
-    echo "Usage: $0 <workspace_dir> [--components] [--aidl] [--ignore-registered]"
+    echo "Usage: $0 <workspace_dir> [--components] [--aidl] [--dex-export] [--ignore-registered]"
     echo "  <workspace_dir>       firmware dump directory (contains packages/ etc.)"
     echo "  --components          run component accessibility analysis only"
     echo "  --aidl                run AIDL interface search only"
+    echo "  --dex-export          export full DEX feature database (dex_index.db)"
     echo "  --ignore-registered   output all AIDL interfaces (default: only registered services)"
-    echo "  (default: run both)"
+    echo "  (default: run components + aidl)"
     echo ""
     echo "Helper:"
     echo "  $0 --build            build/rebuild analyzer jar only"

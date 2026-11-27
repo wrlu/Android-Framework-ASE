@@ -303,178 +303,23 @@ public final class ClassDiffMain {
     }
 
     // ------------------------------------------------------------------ //
-    // Fingerprints
+    // Fingerprints (delegated to DexFingerprint)
     // ------------------------------------------------------------------ //
 
-    private static final Pattern EXT_SYNTH_TYPE =
-            Pattern.compile("L[^;]+\\$\\$ExternalSynthetic[^;]*;");
-    private static final Pattern LAMBDA_METHOD = Pattern.compile("lambda\\$[^$]*\\$\\d+");
-    private static final Pattern ACCESS_METHOD = Pattern.compile("access\\$\\d+");
-    private static final Pattern R8_SYM = Pattern.compile("\\$r8\\$[A-Za-z0-9_$]+");
-    private static final Pattern NEST_METHOD = Pattern.compile("-?\\$\\$Nest\\$[A-Za-z0-9_$]+");
-    private static final Pattern OBF_ROOT_TYPE =
-            Pattern.compile("^([a-z]{1,4}[0-9]*|[a-zA-Z]{1,2}[0-9]*)$");
-    private static final Pattern OBF_PKG_SEG = Pattern.compile("^[a-z]{1,2}[0-9]*$");
-    private static final Pattern OBF_SIMPLE_LOWER = Pattern.compile("^[a-z]{1,3}[0-9]*$");
-    private static final Pattern OBF_SIMPLE_MIXED = Pattern.compile("^[a-zA-Z]{1,2}[0-9]*$");
-    private static final Pattern OBF_MEMBER_IN_OBF =
-            Pattern.compile("^([a-z]{1,3}[0-9]*|[a-zA-Z]{1,2}[0-9]*)$");
-    private static final Pattern OBF_MEMBER_IN_KEEP =
-            Pattern.compile("^([a-z]|[a-z][A-Z]|[a-z]{2,3}[0-9]+)$");
-
     private static boolean isStdLibClass(String desc) {
-        if (desc == null || !desc.startsWith("L") || !desc.endsWith(";")) {
-            return false;
-        }
-        String inner = desc.substring(1, desc.length() - 1);
-        return inner.startsWith("java/") || inner.startsWith("javax/")
-                || inner.startsWith("kotlin/") || inner.startsWith("kotlinx/")
-                || inner.startsWith("dalvik/") || inner.startsWith("org/json/")
-                || inner.startsWith("org/w3c/") || inner.startsWith("org/xml/");
-    }
-
-    private static boolean isObfuscatedType(String desc) {
-        if (desc == null || !desc.startsWith("L") || !desc.endsWith(";")
-                || isStdLibClass(desc)) {
-            return false;
-        }
-        String inner = desc.substring(1, desc.length() - 1);
-        int dollar = inner.indexOf('$');
-        String outer = dollar > 0 ? inner.substring(0, dollar) : inner;
-        int slash = outer.lastIndexOf('/');
-        if (slash < 0) {
-            return OBF_ROOT_TYPE.matcher(outer).matches();
-        }
-        String simple = outer.substring(slash + 1);
-        if (OBF_SIMPLE_LOWER.matcher(simple).matches()) {
-            return true;
-        }
-        if (OBF_SIMPLE_MIXED.matcher(simple).matches()) {
-            String[] pkgParts = outer.substring(0, slash).split("/");
-            for (String seg : pkgParts) {
-                if (OBF_PKG_SEG.matcher(seg).matches()) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    private static String normalizeTypeDesc(String desc) {
-        if (desc == null || desc.isEmpty()) {
-            return "";
-        }
-        int dims = 0;
-        while (dims < desc.length() && desc.charAt(dims) == '[') {
-            dims++;
-        }
-        String base = dims > 0 ? desc.substring(dims) : desc;
-        if (isObfuscatedType(base)) {
-            return dims > 0 ? desc.substring(0, dims) + "L#OBF;" : "L#OBF;";
-        }
-        return desc;
-    }
-
-    private static String normalizeMemberName(String definingDesc, String name) {
-        if (name == null || name.equals("<init>") || name.equals("<clinit>")
-                || isStdLibClass(definingDesc)) {
-            return name;
-        }
-        if (isObfuscatedType(definingDesc)) {
-            if (OBF_MEMBER_IN_OBF.matcher(name).matches()) {
-                return "#obf";
-            }
-        } else if (OBF_MEMBER_IN_KEEP.matcher(name).matches()) {
-            return "#obf";
-        }
-        return name;
+        return DexFingerprint.isStdLibClass(desc);
     }
 
     private static String normalizedMethodKey(String definingDesc, String rawMethodKey) {
-        int lp = rawMethodKey.indexOf('(');
-        int rp = rawMethodKey.lastIndexOf(')');
-        if (lp <= 0 || rp < lp) {
-            return rawMethodKey;
-        }
-        String name = normalizeMemberName(definingDesc, rawMethodKey.substring(0, lp));
-        String paramsRaw = rawMethodKey.substring(lp + 1, rp);
-        String ret = normalizeTypeDesc(rawMethodKey.substring(rp + 1));
-        if (paramsRaw.isEmpty()) {
-            return name + "()" + ret;
-        }
-        String[] parts = paramsRaw.split(",");
-        StringBuilder sb = new StringBuilder(name).append('(');
-        for (int i = 0; i < parts.length; i++) {
-            if (i > 0) sb.append(',');
-            sb.append(normalizeTypeDesc(parts[i]));
-        }
-        return sb.append(')').append(ret).toString();
+        return DexFingerprint.normalizedMethodKey(definingDesc, rawMethodKey, false);
     }
 
     private static Map<String, String> computeMethodHashes(ClassDef classDef) {
-        Map<String, String> hashes = new HashMap<>();
-        for (Method method : classDef.getMethods()) {
-            if (isSynthetic(method.getName())) {
-                continue;
-            }
-            hashes.put(methodKey(method), methodBodyHash(method));
-        }
-        return hashes;
+        return DexFingerprint.computeMethodHashes(classDef, false);
     }
 
     private static String classBodyHash(String definingDesc, Map<String, String> methodHashes) {
-        List<String> entries = new ArrayList<>(methodHashes.size());
-        for (Map.Entry<String, String> entry : methodHashes.entrySet()) {
-            entries.add(normalizedMethodKey(definingDesc, entry.getKey())
-                    + '=' + entry.getValue());
-        }
-        Collections.sort(entries);
-        StringBuilder sb = new StringBuilder(Math.max(256, entries.size() * 96));
-        for (String line : entries) {
-            sb.append(line).append('\n');
-        }
-        return sha256(sb.toString());
-    }
-
-    private static String methodBodyHash(Method method) {
-        MethodImplementation implementation = method.getImplementation();
-        if (implementation == null) {
-            return "abstract";
-        }
-        StringBuilder sb = new StringBuilder(512);
-        List<Instruction> kept = new ArrayList<>();
-        List<Integer> keptAddresses = new ArrayList<>();
-        TreeMap<Integer, Integer> addressToIndex = new TreeMap<>();
-        int address = 0;
-        for (Instruction instruction : implementation.getInstructions()) {
-            if (!isNoiseInstruction(instruction)) {
-                addressToIndex.put(address, kept.size());
-                kept.add(instruction);
-                keptAddresses.add(address);
-            }
-            address += instruction.getCodeUnits();
-        }
-        int endAddress = address;
-        for (int i = 0; i < kept.size(); i++) {
-            sb.append(canonicalInstruction(kept.get(i), keptAddresses.get(i), addressToIndex))
-                    .append(';');
-        }
-        sb.append('\n');
-        for (TryBlock<? extends ExceptionHandler> tryBlock : implementation.getTryBlocks()) {
-            int start = resolveIndex(addressToIndex, tryBlock.getStartCodeAddress(),
-                    endAddress, kept.size());
-            int end = resolveIndex(addressToIndex,
-                    tryBlock.getStartCodeAddress() + tryBlock.getCodeUnitCount(),
-                    endAddress, kept.size());
-            for (ExceptionHandler handler : tryBlock.getExceptionHandlers()) {
-                int target = resolveIndex(addressToIndex, handler.getHandlerCodeAddress(),
-                        endAddress, kept.size());
-                sb.append("try ").append(start).append('-').append(end)
-                        .append(" -> ").append(nullSafe(handler.getExceptionType()))
-                        .append('@').append(target).append(';');
-            }
-        }
-        return sha256(sb.toString());
+        return DexFingerprint.classBodyHash(definingDesc, methodHashes, false);
     }
 
     private static boolean isTrackableBinderSuper(String desc) {
@@ -721,152 +566,15 @@ public final class ClassDiffMain {
     }
 
     private static String methodRefKey(MethodReference method) {
-        return method.getName() + "(" + String.join(",", method.getParameterTypes()) + ")"
-                + method.getReturnType();
-    }
-
-    private static boolean isNoiseInstruction(Instruction instruction) {
-        String op = instruction.getOpcode().name;
-        return op.equals("nop")
-                || op.equals("move") || op.equals("move/from16") || op.equals("move/16")
-                || op.equals("move-wide") || op.equals("move-wide/from16") || op.equals("move-wide/16")
-                || op.equals("move-object") || op.equals("move-object/from16") || op.equals("move-object/16");
-    }
-
-    private static int resolveIndex(TreeMap<Integer, Integer> addressToIndex, int target,
-                                    int endAddress, int keptSize) {
-        Map.Entry<Integer, Integer> entry = addressToIndex.ceilingEntry(target);
-        if (entry != null) {
-            return entry.getValue();
-        }
-        return target >= endAddress ? keptSize : -1;
-    }
-
-    private static String normalizeOpcode(String op) {
-        if (op.endsWith("/range")) {
-            return op.substring(0, op.length() - 6);
-        }
-        if (op.endsWith("/2addr")) {
-            return op.substring(0, op.length() - 6);
-        }
-        if (op.endsWith("/lit8") || op.endsWith("/lit16")) {
-            return op.substring(0, op.lastIndexOf('/'));
-        }
-        if (op.equals("const-string/jumbo")) {
-            return "const-string";
-        }
-        if (op.startsWith("goto/")) {
-            return "goto";
-        }
-        if (op.equals("const/4") || op.equals("const/16") || op.equals("const/high16")) {
-            return "const";
-        }
-        if (op.startsWith("const-wide/")) {
-            return "const-wide";
-        }
-        return op;
-    }
-
-    private static boolean isResourceId(int value) {
-        int pkg = (value >>> 24) & 0xFF;
-        int type = (value >>> 16) & 0xFF;
-        return (pkg == 0x01 || pkg == 0x7f) && type >= 0x01 && type <= 0x2f;
-    }
-
-    private static String canonicalInstruction(Instruction instruction, int address,
-                                               TreeMap<Integer, Integer> addressToIndex) {
-        StringBuilder sb = new StringBuilder(normalizeOpcode(instruction.getOpcode().name));
-        if (instruction instanceof ReferenceInstruction) {
-            sb.append(' ').append(canonicalReference(
-                    ((ReferenceInstruction) instruction).getReference()));
-        }
-        if (instruction instanceof NarrowLiteralInstruction) {
-            int literal = ((NarrowLiteralInstruction) instruction).getNarrowLiteral();
-            if (isResourceId(literal)) {
-                sb.append(" #RES");
-            } else {
-                sb.append(" #").append(literal);
-            }
-        } else if (instruction instanceof WideLiteralInstruction) {
-            sb.append(" #").append(((WideLiteralInstruction) instruction).getWideLiteral());
-        }
-        if (instruction instanceof OffsetInstruction) {
-            int target = address + ((OffsetInstruction) instruction).getCodeOffset();
-            Map.Entry<Integer, Integer> entry = addressToIndex.ceilingEntry(target);
-            sb.append(" @").append(entry != null ? entry.getValue() : -1);
-        }
-        if (instruction instanceof SwitchPayload) {
-            TreeSet<Integer> keys = new TreeSet<>();
-            for (SwitchElement element : ((SwitchPayload) instruction).getSwitchElements()) {
-                keys.add(element.getKey());
-            }
-            sb.append(" keys=").append(keys);
-        }
-        if (instruction instanceof ArrayPayload) {
-            sb.append(" values=").append(((ArrayPayload) instruction).getArrayElements());
-        }
-        return sb.toString();
-    }
-
-    private static String canonicalReference(Reference reference) {
-        if (reference instanceof StringReference) {
-            return "S:" + ((StringReference) reference).getString();
-        }
-        String raw;
-        if (reference instanceof TypeReference) {
-            raw = "T:" + normalizeTypeDesc(((TypeReference) reference).getType());
-        } else if (reference instanceof FieldReference) {
-            FieldReference field = (FieldReference) reference;
-            String defining = field.getDefiningClass();
-            raw = "F:" + normalizeTypeDesc(defining) + "->"
-                    + normalizeMemberName(defining, field.getName()) + ":"
-                    + normalizeTypeDesc(field.getType());
-        } else if (reference instanceof MethodReference) {
-            MethodReference method = (MethodReference) reference;
-            String defining = method.getDefiningClass();
-            List<String> params = new ArrayList<>();
-            for (CharSequence param : method.getParameterTypes()) {
-                params.add(normalizeTypeDesc(param.toString()));
-            }
-            raw = "M:" + normalizeTypeDesc(defining) + "->"
-                    + normalizeMemberName(defining, method.getName())
-                    + "(" + String.join(",", params) + ")"
-                    + normalizeTypeDesc(method.getReturnType());
-        } else {
-            raw = reference.getClass().getSimpleName() + ":" + reference;
-        }
-        String normalized = EXT_SYNTH_TYPE.matcher(raw).replaceAll("L\\$\\$ExternalSynthetic;");
-        normalized = LAMBDA_METHOD.matcher(normalized).replaceAll("lambda\\$");
-        normalized = ACCESS_METHOD.matcher(normalized).replaceAll("access\\$");
-        normalized = R8_SYM.matcher(normalized).replaceAll("\\$r8\\$");
-        normalized = NEST_METHOD.matcher(normalized).replaceAll("\\$\\$Nest\\$");
-        return normalized;
+        return DexFingerprint.methodRefKey(method);
     }
 
     private static String methodKey(Method method) {
-        return method.getName() + "(" + String.join(",", method.getParameterTypes()) + ")"
-                + method.getReturnType();
+        return DexFingerprint.methodKey(method);
     }
 
     private static boolean isSynthetic(String name) {
-        return name.startsWith("lambda$")
-                || name.contains("$$ExternalSynthetic")
-                || name.startsWith("access$")
-                || name.startsWith("$r8$")
-                || name.startsWith("-$$Nest$")
-                || name.startsWith("$$Nest$");
-    }
-
-    private static String sha256(String text) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hash = digest.digest(text.getBytes(StandardCharsets.UTF_8));
-            StringBuilder sb = new StringBuilder(hash.length * 2);
-            for (byte b : hash) sb.append(String.format("%02x", b));
-            return sb.toString();
-        } catch (Exception e) {
-            throw new IllegalStateException(e);
-        }
+        return DexFingerprint.isSynthetic(name);
     }
 
     private static List<String> referencedEnclosingClasses(ClassDef classDef) {

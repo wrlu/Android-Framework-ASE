@@ -99,6 +99,7 @@ flowchart TD
 | **静态层** | `accessible_comp.json` | `java_analyzer` | `diff_analyzer`、`ase_shell` | 弱权限可达组件子集（仅 `exported=true` 且 `enabled!=false`） |
 | **静态层** | `service_aidl.txt`、`accessible_service_aidl.txt` | `java_analyzer` | `native_analyzer`、`post_analyzer`、`diff_analyzer`、`ase_shell` | Java AIDL 接口、实现类（raw class name）与方法签名 |
 | **静态层** | `native_aidl.txt`、`accessible_native_aidl.txt` | `native_analyzer` | `post_analyzer`、`diff_analyzer`、`ase_shell` | Native AIDL 接口、`.so`、backend、`onTransact` 与还原的方法签名 |
+| **索引层** | `dex_index.db`（SQLite） | `java_analyzer`（`DexExportMain`） | 全量 Class Diff / SCA / 调用图查询 | 单固件全量 DEX 离线特征库（容器、类、逐方法指纹、字符串倒排、类级调用边） |
 | **对账层** | `unresolved_accessible_services.txt` | `post_analyzer` | 人工审计 / `runner.py` | 实机可达但未匹配到 Java/Native AIDL 的盲区服务 |
 | **差异层** | `diff.json`（`schema_version: 3`） | `diff_analyzer` | 下游漏洞扫描器 / 人工审计 | 双 dump 结构化差异报告 |
 

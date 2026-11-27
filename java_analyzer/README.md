@@ -11,7 +11,7 @@ Java 层静态分析模块：扫描 APK / framework jar / Mainline JAR，输出�
 ```bash
 cd java_analyzer
 ./gradlew shadowJar      # 产物 build/libs/analyzer-1.0.0-all.jar
-./analyzer.sh <workspace_dir> [--components] [--aidl] [--ignore-registered]
+./analyzer.sh <workspace_dir> [--components] [--aidl] [--dex-export] [--ignore-registered]
 ```
 
 也可以只构建：
@@ -31,8 +31,9 @@ JAVA_OPTS="-Xmx8g" ./analyzer.sh <workspace_dir>
 | `<workspace_dir>` | collector 产出的 dump 目录 |
 | `--components` | 仅运行组件权限分析 |
 | `--aidl` | 仅运行 Java AIDL 接口搜索 |
+| `--dex-export` | 导出全量 DEX 特征库 `<workspace>/dex_index.db`（SQLite） |
 | `--ignore-registered` | 不按 `service_list.txt` 过滤，输出全部 AIDL 接口 |
-| 默认 | 两个分析都运行 |
+| 默认 | 运行 `--components` + `--aidl` |
 
 AIDL 实现类统一输出底层真实原生字节码类名（Raw Class Name，如 `$1`），避免 JADX 的 `AnonymousClass` 反混淆重命名，保证与 Frida、Xposed 及 Java 反射环境兼容。
 
@@ -110,6 +111,22 @@ android.app.ILocaleManager.getApplicationLocales(java.lang.String, int):android.
 ```
 
 `accessible_services.txt` 以服务名记录，分析时通过 `service_list.txt` 的“服务名 → descriptor”映射回 AIDL 接口并记录对应服务名。
+
+---
+
+## DEX 特征库导出（DexExport）
+
+- 入口：`net.wrlu.android.ase.dexexport.DexExportMain`（或 `./analyzer.sh <workspace_dir> --dex-export` / `./run.sh <workspace_dir> --dex-export`）
+- 产物：`<workspace_dir>/dex_index.db`（单文件 SQLite 数据库，原子落盘）
+- 扫描范围：`packages/**/*.apk`、`packages/**/*.jar`、`apex/*/javalib/*.jar`（跳过软链接与 `auto_generated_rro_product`），逐容器流式处理
+- 表结构（指纹列统一为完整 20 字节 SHA-1 `BLOB`）：
+  - `meta`：库元信息（`schema_version=1`、`hash_algorithm=sha1_blob`、统计数、生成时间）
+  - `containers`：容器路径、包/模块名、类型（`apk`/`framework_jar`/`apex_jar`）、SHA256、DEX 数与类数
+  - `symbols`：跨类调用目标符号字典表（`id` ↔ `desc`）
+  - `classes`：全量类描述符、父类、接口、访问标志、混淆标记、方法/字段数、`exact_hash`、`fuzzy_hash`（全混淆无关）、`string_hash`
+  - `methods`：逐方法 `exact_body_hash`
+  - `class_strings`：高区分度字符串常量（长度 `>= 6` 且非纯数字）倒排哈希表
+  - `call_edges`：类级跨类调用边 `(caller_class_id, callee_sym_id)`（排除自环与标准库）
 
 ---
 
